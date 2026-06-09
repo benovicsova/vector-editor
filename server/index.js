@@ -7,7 +7,7 @@ const app = express();
 
 app.use(cors());
 
-const httpServer = createServer(app);
+const server = createServer(app);
 
 const io = new Server(server, {
   cors: {
