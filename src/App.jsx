@@ -11,7 +11,7 @@ import { exportSvg } from "./utils/svgExport";
 import { downloadTextFile } from "./utils/fileDownload";
 import { duplicateShape } from "./utils/geometry";
 
-const SOCKET_URL = "http://localhost:3001";
+const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || "http://localhost:3001";
 
 export default function App() {
   const [tool, setTool] = useState(TOOL.SELECT);
