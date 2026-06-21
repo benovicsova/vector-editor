@@ -12,6 +12,7 @@ import {
 import ShapeRenderer from "./ShapeRenderer";
 
 const ERASER_RADIUS = 22;
+const MIN_SHAPE_SIZE = 4;
 
 function distanceToSegment(point, a, b) {
   const dx = b.x - a.x;
@@ -152,6 +153,23 @@ function getConstrainedBox(start, current, shouldConstrain) {
   };
 }
 
+function isDraftLargeEnough(draft) {
+  if (!draft) return false;
+
+  if (draft.type === "rect" || draft.type === "ellipse") {
+    return Math.abs(draft.w) >= MIN_SHAPE_SIZE || Math.abs(draft.h) >= MIN_SHAPE_SIZE;
+  }
+
+  if (draft.type === "triangle-box") {
+    return (
+      Math.abs(draft.x2 - draft.x1) >= MIN_SHAPE_SIZE ||
+      Math.abs(draft.y2 - draft.y1) >= MIN_SHAPE_SIZE
+    );
+  }
+
+  return true;
+}
+
 export default function EditorCanvas({
   tool,
   setTool,
@@ -168,7 +186,10 @@ export default function EditorCanvas({
   dragInfo,
   setDragInfo,
   zoom,
-  setZoom
+  setZoom,
+  lockedShapeIds = [],
+  lockShape,
+  unlockShape
 }) {
   const [camera, setCamera] = useState({
     x: CANVAS_WIDTH / 2,
@@ -195,6 +216,10 @@ export default function EditorCanvas({
 
   const style = { fill, stroke, strokeWidth };
 
+  function isLocked(shapeId) {
+    return lockedShapeIds.includes(shapeId);
+  }
+
   function screenPointToSvgPoint(event, svg) {
     const point = svg.createSVGPoint();
 
@@ -220,7 +245,10 @@ export default function EditorCanvas({
 
   function eraseAt(point) {
     setShapes((prev) =>
-      prev.filter((shape) => !eraserTouchesShape(point, shape, ERASER_RADIUS / zoom))
+      prev.filter((shape) => {
+        if (isLocked(shape.id)) return true;
+        return !eraserTouchesShape(point, shape, ERASER_RADIUS / zoom);
+      })
     );
   }
 
@@ -296,17 +324,47 @@ export default function EditorCanvas({
       };
 
       setShapes((prev) => [...prev, newShape]);
-      setSelectedId(newShape.id);
-      setDragInfo({ mode: "pen-draw", shapeId: newShape.id });
+
+      setDragInfo({
+        mode: "pen-draw",
+        shapeId: newShape.id,
+        startPoint: point
+      });
     }
   }
 
   function focusShape(shape) {
+    if (isLocked(shape.id)) return;
+
     setTool(TOOL.SELECT);
     setSelectedId(shape.id);
     setDraft(null);
     setDragInfo(null);
     setEraserPosition(null);
+  }
+
+  function finishActiveEdit() {
+    if (dragInfo?.mode === "pen-draw") {
+      setShapes((prev) => {
+        const shape = prev.find((item) => item.id === dragInfo.shapeId);
+
+        if (!shape || shape.points.length < 2) {
+          return prev.filter((item) => item.id !== dragInfo.shapeId);
+        }
+
+        return prev;
+      });
+
+      return;
+    }
+
+    if (dragInfo?.mode === "move-shape" || dragInfo?.mode === "move-point") {
+      setShapes((prev) => prev);
+
+      if (dragInfo.shapeId) {
+        unlockShape?.(dragInfo.shapeId);
+      }
+    }
   }
 
   function handleWheel(event) {
@@ -356,7 +414,7 @@ export default function EditorCanvas({
     }
 
     if (tool === TOOL.SELECT || tool === TOOL.FILL) {
-      if (event.target === event.currentTarget) setSelectedId(null);
+      setSelectedId(null);
       return;
     }
 
@@ -420,6 +478,13 @@ export default function EditorCanvas({
       setShapesLive((prev) =>
         prev.map((shape) => {
           if (shape.id !== dragInfo.shapeId) return shape;
+
+          if (event.shiftKey && dragInfo.startPoint) {
+            return {
+              ...shape,
+              points: [dragInfo.startPoint, p]
+            };
+          }
 
           const last = shape.points[shape.points.length - 1];
           if (last && distance(last, p) < 25) return shape;
@@ -487,7 +552,11 @@ export default function EditorCanvas({
   }
 
   function handlePointerUp() {
-    if (draft?.type === "rect") {
+    const hadDraft = Boolean(draft);
+    const wasPenDrawing = dragInfo?.mode === "pen-draw";
+    const wasErasing = dragInfo?.mode === "erase";
+
+    if (draft?.type === "rect" && isDraftLargeEnough(draft)) {
       const shape = {
         id: uid(),
         visible: true,
@@ -495,10 +564,9 @@ export default function EditorCanvas({
       };
 
       setShapes((prev) => [...prev, shape]);
-      setSelectedId(shape.id);
     }
 
-    if (draft?.type === "ellipse") {
+    if (draft?.type === "ellipse" && isDraftLargeEnough(draft)) {
       const shape = {
         id: uid(),
         visible: true,
@@ -506,14 +574,18 @@ export default function EditorCanvas({
       };
 
       setShapes((prev) => [...prev, shape]);
-      setSelectedId(shape.id);
     }
 
-    if (draft?.type === "triangle-box") {
+    if (draft?.type === "triangle-box" && isDraftLargeEnough(draft)) {
       const shape = createTriangleFromBox(draft.x1, draft.y1, draft.x2, draft.y2, style);
 
       setShapes((prev) => [...prev, shape]);
-      setSelectedId(shape.id);
+    }
+
+    finishActiveEdit();
+
+    if (hadDraft || wasPenDrawing || wasErasing) {
+      setSelectedId(null);
     }
 
     setDraft(null);
@@ -544,14 +616,35 @@ export default function EditorCanvas({
       return;
     }
 
-    if (tool === TOOL.FILL) {
-      setShapes((prev) =>
-        prev.map((item) =>
-          item.id === shape.id ? { ...item, fill } : item
-        )
-      );
+    if (isLocked(shape.id)) {
+      return;
+    }
 
-      setSelectedId(shape.id);
+    if (tool === TOOL.FILL) {
+      lockShape?.(shape.id, () => {
+        setShapes((prev) =>
+          prev.map((item) => {
+            if (item.id !== shape.id) return item;
+
+            if (item.type === "pen") {
+              if (fill === "none") return item;
+
+              return {
+                ...item,
+                stroke: fill
+              };
+            }
+
+            return {
+              ...item,
+              fill
+            };
+          })
+        );
+
+        unlockShape?.(shape.id);
+      });
+
       return;
     }
 
@@ -570,23 +663,26 @@ export default function EditorCanvas({
     }
 
     const p = getPointerFromSvg(event);
-    setSelectedId(shape.id);
 
-    if (shape.type === "rect" || shape.type === "ellipse") {
-      setDragInfo({
-        mode: "move-shape",
-        shapeId: shape.id,
-        start: p,
-        original: { x: shape.x, y: shape.y }
-      });
-    } else {
-      setDragInfo({
-        mode: "move-shape",
-        shapeId: shape.id,
-        start: p,
-        originalPoints: shape.points.map((pt) => ({ ...pt }))
-      });
-    }
+    lockShape?.(shape.id, () => {
+      setSelectedId(shape.id);
+
+      if (shape.type === "rect" || shape.type === "ellipse") {
+        setDragInfo({
+          mode: "move-shape",
+          shapeId: shape.id,
+          start: p,
+          original: { x: shape.x, y: shape.y }
+        });
+      } else {
+        setDragInfo({
+          mode: "move-shape",
+          shapeId: shape.id,
+          start: p,
+          originalPoints: shape.points.map((pt) => ({ ...pt }))
+        });
+      }
+    });
   }
 
   function handleShapeDoubleClick(event, shape) {
@@ -618,30 +714,35 @@ export default function EditorCanvas({
     event.stopPropagation();
 
     if (tool !== TOOL.SELECT) return;
+    if (isLocked(shape.id)) return;
 
-    if (shape.type === "rect" || shape.type === "ellipse") {
-      const points = getEditPoints(shape);
+    lockShape?.(shape.id, () => {
+      setSelectedId(shape.id);
 
-      const oppositePointMap = {
-        0: 2,
-        1: 3,
-        2: 0,
-        3: 1
-      };
+      if (shape.type === "rect" || shape.type === "ellipse") {
+        const points = getEditPoints(shape);
 
-      setDragInfo({
-        mode: "move-point",
-        shapeId: shape.id,
-        pointIndex,
-        anchor: points[oppositePointMap[pointIndex]]
-      });
-    } else {
-      setDragInfo({
-        mode: "move-point",
-        shapeId: shape.id,
-        pointIndex
-      });
-    }
+        const oppositePointMap = {
+          0: 2,
+          1: 3,
+          2: 0,
+          3: 1
+        };
+
+        setDragInfo({
+          mode: "move-point",
+          shapeId: shape.id,
+          pointIndex,
+          anchor: points[oppositePointMap[pointIndex]]
+        });
+      } else {
+        setDragInfo({
+          mode: "move-point",
+          shapeId: shape.id,
+          pointIndex
+        });
+      }
+    });
   }
 
   return (
@@ -676,6 +777,7 @@ export default function EditorCanvas({
               <ShapeRenderer
                 shape={shape}
                 selected={shape.id === selectedId}
+                locked={isLocked(shape.id)}
                 onPointerDown={(e) => handleShapePointerDown(e, shape)}
               />
             </g>

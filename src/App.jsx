@@ -7,11 +7,11 @@ import { initialShapes } from "./data/initialShapes";
 import Toolbar from "./components/Toolbar";
 import EditorCanvas from "./components/EditorCanvas";
 
-import { exportSvg } from "./utils/svgExport";
 import { downloadTextFile } from "./utils/fileDownload";
-import { duplicateShape } from "./utils/geometry";
+import { duplicateShape, getBoundingBox } from "./utils/geometry";
 
 const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || "http://localhost:3001";
+const DEFAULT_PROJECT_NAME = "projekt-vektor-editor";
 
 export default function App() {
   const [tool, setTool] = useState(TOOL.SELECT);
@@ -27,6 +27,8 @@ export default function App() {
   const [stroke, setStroke] = useState("#1f2937");
   const [strokeWidth, setStrokeWidth] = useState(4);
 
+  const [projectName, setProjectName] = useState("");
+
   const [zoom, setZoom] = useState(1);
 
   const [draft, setDraft] = useState(null);
@@ -34,6 +36,7 @@ export default function App() {
 
   const [roomId, setRoomId] = useState("");
   const [connectionStatus, setConnectionStatus] = useState("offline");
+  const [lockedShapeIds, setLockedShapeIds] = useState([]);
 
   const [roomModal, setRoomModal] = useState(null);
   const [joinInput, setJoinInput] = useState("");
@@ -41,8 +44,34 @@ export default function App() {
 
   const socketRef = useRef(null);
   const roomIdRef = useRef("");
+  const shapesRef = useRef(shapes);
+  const dragInfoRef = useRef(dragInfo);
+  const historyRef = useRef(history);
+  const historyIndexRef = useRef(historyIndex);
 
   const selectedShape = shapes.find((shape) => shape.id === selectedId) ?? null;
+
+  useEffect(() => {
+    shapesRef.current = shapes;
+    dragInfoRef.current = dragInfo;
+    historyRef.current = history;
+    historyIndexRef.current = historyIndex;
+  }, [shapes, dragInfo, history, historyIndex]);
+
+  useEffect(() => {
+    if (!selectedShape) return;
+
+    if (selectedShape.type === "pen") {
+      setFill(selectedShape.stroke || "#1f2937");
+      setStroke(selectedShape.stroke || "#1f2937");
+      setStrokeWidth(selectedShape.strokeWidth || 4);
+      return;
+    }
+
+    setFill(selectedShape.fill || "none");
+    setStroke(selectedShape.stroke || "#1f2937");
+    setStrokeWidth(selectedShape.strokeWidth || 4);
+  }, [selectedId]);
 
   useEffect(() => {
     const socket = io(SOCKET_URL);
@@ -55,16 +84,50 @@ export default function App() {
 
     socket.on("disconnect", () => {
       setConnectionStatus("offline");
+      setLockedShapeIds([]);
     });
 
     socket.on("canvas-update", ({ shapes: remoteShapes }) => {
       if (!Array.isArray(remoteShapes)) return;
 
-      setHistory([remoteShapes]);
+      const localEditingShapeId = dragInfoRef.current?.shapeId;
+      const localShapes = shapesRef.current;
+
+      let nextShapes = remoteShapes;
+
+      if (localEditingShapeId) {
+        const localShape = localShapes.find((shape) => shape.id === localEditingShapeId);
+
+        if (localShape) {
+          const remoteHasShape = remoteShapes.some(
+            (shape) => shape.id === localEditingShapeId
+          );
+
+          nextShapes = remoteShapes.map((shape) =>
+            shape.id === localEditingShapeId ? localShape : shape
+          );
+
+          if (!remoteHasShape) {
+            nextShapes = [...nextShapes, localShape];
+          }
+        }
+      }
+
+      setHistory([nextShapes]);
       setHistoryIndex(0);
-      setSelectedId(null);
-      setDraft(null);
-      setDragInfo(null);
+      setSelectedId((prev) =>
+        prev && nextShapes.some((shape) => shape.id === prev) ? prev : null
+      );
+    });
+
+    socket.on("shape-locked", ({ shapeId }) => {
+      setLockedShapeIds((prev) =>
+        prev.includes(shapeId) ? prev : [...prev, shapeId]
+      );
+    });
+
+    socket.on("shape-unlocked", ({ shapeId }) => {
+      setLockedShapeIds((prev) => prev.filter((id) => id !== shapeId));
     });
 
     return () => {
@@ -84,6 +147,27 @@ export default function App() {
 
       if (isTyping) return;
 
+      const key = event.key.toLowerCase();
+      const ctrlOrMeta = event.ctrlKey || event.metaKey;
+
+      if (ctrlOrMeta && key === "z") {
+        event.preventDefault();
+
+        if (event.shiftKey) {
+          redo();
+        } else {
+          undo();
+        }
+
+        return;
+      }
+
+      if (ctrlOrMeta && key === "y") {
+        event.preventDefault();
+        redo();
+        return;
+      }
+
       if (event.key === "Delete" || event.key === "Backspace") {
         if (!selectedId) return;
 
@@ -97,7 +181,7 @@ export default function App() {
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [selectedId, shapes]);
+  }, [selectedId, lockedShapeIds]);
 
   function syncShapes(nextShapes) {
     if (!roomIdRef.current) return;
@@ -111,7 +195,7 @@ export default function App() {
 
   function commitShapes(nextShapes, shouldSync = true) {
     setHistory((prev) => {
-      const sliced = prev.slice(0, historyIndex + 1);
+      const sliced = prev.slice(0, historyIndexRef.current + 1);
       return [...sliced, nextShapes];
     });
 
@@ -123,18 +207,122 @@ export default function App() {
   }
 
   function setShapesDirect(updater) {
-    const nextShapes = typeof updater === "function" ? updater(shapes) : updater;
+    const currentShapes = shapesRef.current;
+    const nextShapes =
+      typeof updater === "function" ? updater(currentShapes) : updater;
+
     commitShapes(nextShapes);
   }
 
   function setShapesLive(updater) {
-    const nextShapes = typeof updater === "function" ? updater(shapes) : updater;
+    const currentShapes = shapesRef.current;
+    const nextShapes =
+      typeof updater === "function" ? updater(currentShapes) : updater;
 
     setHistory((prev) =>
-      prev.map((item, index) => (index === historyIndex ? nextShapes : item))
+      prev.map((item, index) =>
+        index === historyIndexRef.current ? nextShapes : item
+      )
     );
 
+    shapesRef.current = nextShapes;
     syncShapes(nextShapes);
+  }
+
+  function handleToolChange(nextTool) {
+    setTool(nextTool);
+
+    if (nextTool !== TOOL.SELECT) {
+      setSelectedId(null);
+    }
+  }
+
+  function lockShape(shapeId, onSuccess) {
+    if (!shapeId) return;
+
+    if (!roomIdRef.current || !socketRef.current) {
+      onSuccess?.();
+      return;
+    }
+
+    if (lockedShapeIds.includes(shapeId)) {
+      setRoomError("Tento tvar práve upravuje iný používateľ.");
+      setRoomModal({ type: "error" });
+      return;
+    }
+
+    socketRef.current.emit(
+      "shape-lock",
+      {
+        roomId: roomIdRef.current,
+        shapeId
+      },
+      (response) => {
+        if (!response?.success) {
+          setRoomError(response?.message || "Tento tvar práve upravuje iný používateľ.");
+          setRoomModal({ type: "error" });
+          return;
+        }
+
+        onSuccess?.();
+      }
+    );
+  }
+
+  function unlockShape(shapeId) {
+    if (!shapeId) return;
+    if (!roomIdRef.current || !socketRef.current) return;
+
+    socketRef.current.emit("shape-unlock", {
+      roomId: roomIdRef.current,
+      shapeId
+    });
+  }
+
+  function updateSelectedShapeStyle(property, value) {
+    if (!selectedId) return;
+    if (lockedShapeIds.includes(selectedId)) return;
+
+    lockShape(selectedId, () => {
+      setShapesDirect((prev) =>
+        prev.map((shape) => {
+          if (shape.id !== selectedId) return shape;
+
+          if (shape.type === "pen" && property === "fill") {
+            if (value === "none") return shape;
+
+            return {
+              ...shape,
+              stroke: value
+            };
+          }
+
+          return {
+            ...shape,
+            [property]: value
+          };
+        })
+      );
+
+      unlockShape(selectedId);
+    });
+  }
+
+  function handleFillChange(nextFill) {
+    setFill(nextFill);
+    updateSelectedShapeStyle("fill", nextFill);
+  }
+
+  function handleStrokeChange(nextStroke) {
+    setStroke(nextStroke);
+    updateSelectedShapeStyle("stroke", nextStroke);
+  }
+
+  function handleStrokeWidthChange(nextStrokeWidth) {
+    const normalizedStrokeWidth = Math.max(1, Number(nextStrokeWidth) || 1);
+
+    setStrokeWidth(normalizedStrokeWidth);
+    updateSelectedShapeStyle("strokeWidth", normalizedStrokeWidth);
   }
 
   function createRoom() {
@@ -155,6 +343,7 @@ export default function App() {
 
       setRoomId(response.roomId);
       roomIdRef.current = response.roomId;
+      setLockedShapeIds(response.lockedShapeIds ?? []);
 
       setRoomModal({
         type: "created",
@@ -192,6 +381,7 @@ export default function App() {
 
       setRoomId(response.roomId);
       roomIdRef.current = response.roomId;
+      setLockedShapeIds(response.lockedShapeIds ?? []);
 
       if (Array.isArray(response.shapes)) {
         setHistory([response.shapes]);
@@ -214,10 +404,13 @@ export default function App() {
   }
 
   function undo() {
-    if (historyIndex <= 0) return;
+    const currentHistory = historyRef.current;
+    const currentIndex = historyIndexRef.current;
 
-    const nextIndex = historyIndex - 1;
-    const nextShapes = history[nextIndex];
+    if (currentIndex <= 0) return;
+
+    const nextIndex = currentIndex - 1;
+    const nextShapes = currentHistory[nextIndex];
 
     setHistoryIndex(nextIndex);
     setSelectedId(null);
@@ -225,10 +418,13 @@ export default function App() {
   }
 
   function redo() {
-    if (historyIndex >= history.length - 1) return;
+    const currentHistory = historyRef.current;
+    const currentIndex = historyIndexRef.current;
 
-    const nextIndex = historyIndex + 1;
-    const nextShapes = history[nextIndex];
+    if (currentIndex >= currentHistory.length - 1) return;
+
+    const nextIndex = currentIndex + 1;
+    const nextShapes = currentHistory[nextIndex];
 
     setHistoryIndex(nextIndex);
     setSelectedId(null);
@@ -249,47 +445,182 @@ export default function App() {
 
   function duplicateSelected() {
     if (!selectedShape) return;
+    if (lockedShapeIds.includes(selectedShape.id)) return;
 
-    const copy = duplicateShape(selectedShape);
-    const nextShapes = [...shapes, copy];
+    lockShape(selectedShape.id, () => {
+      const copy = duplicateShape(selectedShape);
+      const nextShapes = [...shapesRef.current, copy];
 
-    setShapesDirect(nextShapes);
-    setSelectedId(copy.id);
+      setShapesDirect(nextShapes);
+      setSelectedId(copy.id);
+      unlockShape(selectedShape.id);
+    });
   }
 
   function deleteSelected() {
     if (!selectedId) return;
+    if (lockedShapeIds.includes(selectedId)) return;
 
-    setShapesDirect((prev) => prev.filter((shape) => shape.id !== selectedId));
-    setSelectedId(null);
+    lockShape(selectedId, () => {
+      setShapesDirect((prev) => prev.filter((shape) => shape.id !== selectedId));
+      unlockShape(selectedId);
+      setSelectedId(null);
+    });
   }
 
   function moveLayer(direction) {
     if (!selectedShape) return;
+    if (lockedShapeIds.includes(selectedShape.id)) return;
 
-    const index = shapes.findIndex((shape) => shape.id === selectedId);
-    const swapIndex = direction === "up" ? index + 1 : index - 1;
+    lockShape(selectedShape.id, () => {
+      const currentShapes = shapesRef.current;
+      const index = currentShapes.findIndex((shape) => shape.id === selectedShape.id);
+      const swapIndex = direction === "up" ? index + 1 : index - 1;
 
-    if (swapIndex < 0 || swapIndex >= shapes.length) return;
+      if (swapIndex < 0 || swapIndex >= currentShapes.length) {
+        unlockShape(selectedShape.id);
+        return;
+      }
 
-    const next = [...shapes];
-    [next[index], next[swapIndex]] = [next[swapIndex], next[index]];
+      const next = [...currentShapes];
+      [next[index], next[swapIndex]] = [next[swapIndex], next[index]];
 
-    setShapesDirect(next);
+      setShapesDirect(next);
+      unlockShape(selectedShape.id);
+    });
   }
 
   function toggleVisible() {
     if (!selectedShape) return;
+    if (lockedShapeIds.includes(selectedShape.id)) return;
 
-    setShapesDirect((prev) =>
-      prev.map((shape) =>
-        shape.id === selectedId ? { ...shape, visible: !shape.visible } : shape
-      )
-    );
+    lockShape(selectedShape.id, () => {
+      setShapesDirect((prev) =>
+        prev.map((shape) =>
+          shape.id === selectedShape.id ? { ...shape, visible: !shape.visible } : shape
+        )
+      );
+
+      unlockShape(selectedShape.id);
+    });
+  }
+
+  function pointsToPath(points) {
+    if (!points || points.length === 0) return "";
+    if (points.length === 1) return `M ${points[0].x} ${points[0].y}`;
+
+    let path = `M ${points[0].x} ${points[0].y}`;
+
+    for (let i = 1; i < points.length - 1; i++) {
+      const current = points[i];
+      const next = points[i + 1];
+
+      const midX = (current.x + next.x) / 2;
+      const midY = (current.y + next.y) / 2;
+
+      path += ` Q ${current.x} ${current.y} ${midX} ${midY}`;
+    }
+
+    const last = points[points.length - 1];
+    path += ` L ${last.x} ${last.y}`;
+
+    return path;
+  }
+
+  function escapeXml(value) {
+    return String(value)
+      .replaceAll("&", "&amp;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;");
+  }
+
+  function getExportBounds(visibleShapes) {
+    if (visibleShapes.length === 0) {
+      return {
+        x: 0,
+        y: 0,
+        width: CANVAS_WIDTH,
+        height: CANVAS_HEIGHT
+      };
+    }
+
+    const boxes = visibleShapes.map((shape) => getBoundingBox(shape));
+
+    const minX = Math.min(...boxes.map((box) => box.x));
+    const minY = Math.min(...boxes.map((box) => box.y));
+    const maxX = Math.max(...boxes.map((box) => box.x + box.w));
+    const maxY = Math.max(...boxes.map((box) => box.y + box.h));
+
+    const padding = 60;
+
+    return {
+      x: minX - padding,
+      y: minY - padding,
+      width: Math.max(maxX - minX + padding * 2, 1),
+      height: Math.max(maxY - minY + padding * 2, 1)
+    };
+  }
+
+  function shapeToSvg(shape) {
+    const fillValue = shape.fill || "none";
+    const strokeValue = shape.stroke || "#1f2937";
+    const strokeWidthValue = Math.max(Number(shape.strokeWidth) || 1, 1);
+
+    if (shape.type === "rect") {
+      const x = Math.min(shape.x, shape.x + shape.w);
+      const y = Math.min(shape.y, shape.y + shape.h);
+      const w = Math.abs(shape.w);
+      const h = Math.abs(shape.h);
+
+      return `<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="${escapeXml(fillValue)}" stroke="${escapeXml(strokeValue)}" stroke-width="${strokeWidthValue}" />`;
+    }
+
+    if (shape.type === "ellipse") {
+      return `<ellipse cx="${shape.x + shape.w / 2}" cy="${shape.y + shape.h / 2}" rx="${Math.abs(shape.w / 2)}" ry="${Math.abs(shape.h / 2)}" fill="${escapeXml(fillValue)}" stroke="${escapeXml(strokeValue)}" stroke-width="${strokeWidthValue}" />`;
+    }
+
+    if (shape.type === "triangle") {
+      const points = shape.points.map((p) => `${p.x},${p.y}`).join(" ");
+
+      return `<polygon points="${points}" fill="${escapeXml(fillValue)}" stroke="${escapeXml(strokeValue)}" stroke-width="${strokeWidthValue}" stroke-linejoin="round" stroke-linecap="round" />`;
+    }
+
+    if (shape.type === "pen") {
+      return `<path d="${pointsToPath(shape.points)}" fill="none" stroke="${escapeXml(strokeValue)}" stroke-width="${strokeWidthValue}" stroke-linejoin="round" stroke-linecap="round" />`;
+    }
+
+    return "";
+  }
+
+  function createExportSvg() {
+    const visibleShapes = shapes.filter((shape) => shape.visible !== false);
+    const bounds = getExportBounds(visibleShapes);
+
+    const svgShapes = visibleShapes.map((shape) => shapeToSvg(shape)).join("\n");
+
+    return {
+      svgText: `<svg xmlns="http://www.w3.org/2000/svg" width="${bounds.width}" height="${bounds.height}" viewBox="${bounds.x} ${bounds.y} ${bounds.width} ${bounds.height}">
+  <rect x="${bounds.x}" y="${bounds.y}" width="${bounds.width}" height="${bounds.height}" fill="white" />
+  ${svgShapes}
+</svg>`,
+      width: Math.ceil(bounds.width),
+      height: Math.ceil(bounds.height)
+    };
+  }
+
+  function getSafeFileName(name) {
+    const normalized = String(name || "")
+      .trim()
+      .replace(/[<>:"/\\|?*]+/g, "-")
+      .replace(/\s+/g, "-");
+
+    return normalized || DEFAULT_PROJECT_NAME;
   }
 
   function handleExportPng() {
-    const svgText = exportSvg(shapes);
+    const { svgText, width, height } = createExportSvg();
+
     const svgBlob = new Blob([svgText], {
       type: "image/svg+xml;charset=utf-8"
     });
@@ -300,8 +631,8 @@ export default function App() {
     image.onload = () => {
       const canvas = document.createElement("canvas");
 
-      canvas.width = CANVAS_WIDTH;
-      canvas.height = CANVAS_HEIGHT;
+      canvas.width = width;
+      canvas.height = height;
 
       const context = canvas.getContext("2d");
 
@@ -314,11 +645,12 @@ export default function App() {
       canvas.toBlob((blob) => {
         if (!blob) return;
 
+        const safeName = getSafeFileName(projectName || DEFAULT_PROJECT_NAME);
         const downloadUrl = URL.createObjectURL(blob);
         const link = document.createElement("a");
 
         link.href = downloadUrl;
-        link.download = "obrazok.png";
+        link.download = `${safeName}.png`;
         link.click();
 
         URL.revokeObjectURL(downloadUrl);
@@ -329,9 +661,32 @@ export default function App() {
   }
 
   function handleExportJson() {
+    let name = projectName.trim();
+
+    if (!name) {
+      const enteredName = window.prompt("Zadaj názov projektu:", DEFAULT_PROJECT_NAME);
+
+      if (!enteredName) return;
+
+      name = enteredName.trim();
+
+      if (!name) return;
+
+      setProjectName(name);
+    }
+
+    const safeName = getSafeFileName(name);
+
     downloadTextFile(
-      "projekt-vektor-editor.json",
-      JSON.stringify(shapes, null, 2),
+      `${safeName}.json`,
+      JSON.stringify(
+        {
+          name,
+          shapes
+        },
+        null,
+        2
+      ),
       "application/json"
     );
   }
@@ -348,7 +703,14 @@ export default function App() {
 
         if (Array.isArray(data)) {
           commitShapes(data);
-          setSelectedId(data[0]?.id ?? null);
+          setSelectedId(null);
+          return;
+        }
+
+        if (Array.isArray(data.shapes)) {
+          commitShapes(data.shapes);
+          setProjectName(data.name || "");
+          setSelectedId(null);
         }
       } catch {
         alert("Import JSON súboru zlyhal.");
@@ -363,13 +725,15 @@ export default function App() {
     <div className="scratch-app">
       <Toolbar
         tool={tool}
-        setTool={setTool}
+        setTool={handleToolChange}
         fill={fill}
-        setFill={setFill}
+        setFill={handleFillChange}
         stroke={stroke}
-        setStroke={setStroke}
+        setStroke={handleStrokeChange}
         strokeWidth={strokeWidth}
-        setStrokeWidth={setStrokeWidth}
+        setStrokeWidth={handleStrokeWidthChange}
+        projectName={projectName}
+        setProjectName={setProjectName}
         onExportPng={handleExportPng}
         onExportJson={handleExportJson}
         onImportJson={handleImportJson}
@@ -395,7 +759,7 @@ export default function App() {
 
       <EditorCanvas
         tool={tool}
-        setTool={setTool}
+        setTool={handleToolChange}
         shapes={shapes}
         setShapes={setShapesDirect}
         setShapesLive={setShapesLive}
@@ -410,6 +774,9 @@ export default function App() {
         setDragInfo={setDragInfo}
         zoom={zoom}
         setZoom={setZoom}
+        lockedShapeIds={lockedShapeIds}
+        lockShape={lockShape}
+        unlockShape={unlockShape}
       />
 
       {roomModal && (

@@ -36,6 +36,8 @@ export default function Toolbar({
   setStroke,
   strokeWidth,
   setStrokeWidth,
+  projectName,
+  setProjectName,
   onExportPng,
   onExportJson,
   onImportJson,
@@ -158,11 +160,11 @@ export default function Toolbar({
 
       <div className="topbar-group">
         <label className="scratch-color" title="Farba výplne">
-          <PaintBucket size={16} />
+          <PaintBucket size={14} />
           <input
             type="color"
             value={fill === "none" ? "#ffffff" : fill}
-            onChange={(e) => setFill(e.target.value)}
+            onChange={(event) => setFill(event.target.value)}
           />
         </label>
 
@@ -175,11 +177,11 @@ export default function Toolbar({
         </button>
 
         <label className="scratch-color" title="Farba obrysu">
-          <span className="stroke-preview" />
+          <span className="stroke-preview" style={{ background: stroke }} />
           <input
             type="color"
             value={stroke}
-            onChange={(e) => setStroke(e.target.value)}
+            onChange={(event) => setStroke(event.target.value)}
           />
         </label>
 
@@ -189,8 +191,20 @@ export default function Toolbar({
           min="1"
           max="30"
           value={strokeWidth}
-          onChange={(e) => setStrokeWidth(Number(e.target.value))}
+          onChange={(event) => setStrokeWidth(Number(event.target.value))}
           title="Hrúbka obrysu"
+        />
+      </div>
+
+      <div className="topbar-separator" />
+
+      <div className="topbar-group">
+        <input
+          className="project-name-input"
+          value={projectName}
+          onChange={(event) => setProjectName(event.target.value)}
+          placeholder="Názov"
+          title="Názov projektu"
         />
       </div>
 
@@ -261,9 +275,7 @@ export default function Toolbar({
         />
       </div>
 
-      <div className="topbar-spacer" />
-
-      <div className="topbar-group">
+      <div className="topbar-group export-tools">
         <IconButton onClick={onExportPng} title="Export PNG">
           <Image />
         </IconButton>

@@ -22,6 +22,31 @@ function generateRoomId() {
   return String(Math.floor(1000 + Math.random() * 9000));
 }
 
+function getRoom(roomId) {
+  return rooms.get(String(roomId || "").trim());
+}
+
+function releaseSocketLocks(socket) {
+  for (const [roomId, room] of rooms.entries()) {
+    if (!room?.locks) continue;
+
+    const releasedShapeIds = [];
+
+    for (const [shapeId, socketId] of room.locks.entries()) {
+      if (socketId === socket.id) {
+        room.locks.delete(shapeId);
+        releasedShapeIds.push(shapeId);
+      }
+    }
+
+    for (const shapeId of releasedShapeIds) {
+      socket.to(roomId).emit("shape-unlocked", {
+        shapeId
+      });
+    }
+  }
+}
+
 io.on("connection", (socket) => {
   console.log("Používateľ pripojený:", socket.id);
 
@@ -33,7 +58,8 @@ io.on("connection", (socket) => {
     }
 
     rooms.set(roomId, {
-      shapes: Array.isArray(shapes) ? shapes : []
+      shapes: Array.isArray(shapes) ? shapes : [],
+      locks: new Map()
     });
 
     socket.join(roomId);
@@ -41,7 +67,8 @@ io.on("connection", (socket) => {
     callback({
       success: true,
       roomId,
-      shapes: rooms.get(roomId).shapes
+      shapes: rooms.get(roomId).shapes,
+      lockedShapeIds: []
     });
 
     console.log(`Miestnosť vytvorená: ${roomId}`);
@@ -58,7 +85,9 @@ io.on("connection", (socket) => {
       return;
     }
 
-    if (!rooms.has(normalizedRoomId)) {
+    const room = getRoom(normalizedRoomId);
+
+    if (!room) {
       callback({
         success: false,
         message: "Miestnosť neexistuje."
@@ -71,7 +100,8 @@ io.on("connection", (socket) => {
     callback({
       success: true,
       roomId: normalizedRoomId,
-      shapes: rooms.get(normalizedRoomId).shapes
+      shapes: room.shapes,
+      lockedShapeIds: Array.from(room.locks.keys())
     });
 
     console.log(
@@ -81,18 +111,73 @@ io.on("connection", (socket) => {
 
   socket.on("canvas-update", ({ roomId, shapes }) => {
     const normalizedRoomId = String(roomId || "").trim();
+    const room = getRoom(normalizedRoomId);
 
-    if (!rooms.has(normalizedRoomId)) return;
+    if (!room) return;
     if (!Array.isArray(shapes)) return;
 
-    rooms.set(normalizedRoomId, { shapes });
+    room.shapes = shapes;
 
     socket.to(normalizedRoomId).emit("canvas-update", {
       shapes
     });
   });
 
+  socket.on("shape-lock", ({ roomId, shapeId }, callback) => {
+    const normalizedRoomId = String(roomId || "").trim();
+    const normalizedShapeId = String(shapeId || "").trim();
+    const room = getRoom(normalizedRoomId);
+
+    if (!room || !normalizedShapeId) {
+      callback?.({
+        success: false,
+        message: "Tvar sa nepodarilo zamknúť."
+      });
+      return;
+    }
+
+    const currentOwner = room.locks.get(normalizedShapeId);
+
+    if (currentOwner && currentOwner !== socket.id) {
+      callback?.({
+        success: false,
+        message: "Tento tvar práve upravuje iný používateľ."
+      });
+      return;
+    }
+
+    room.locks.set(normalizedShapeId, socket.id);
+
+    socket.to(normalizedRoomId).emit("shape-locked", {
+      shapeId: normalizedShapeId
+    });
+
+    callback?.({
+      success: true,
+      shapeId: normalizedShapeId
+    });
+  });
+
+  socket.on("shape-unlock", ({ roomId, shapeId }) => {
+    const normalizedRoomId = String(roomId || "").trim();
+    const normalizedShapeId = String(shapeId || "").trim();
+    const room = getRoom(normalizedRoomId);
+
+    if (!room || !normalizedShapeId) return;
+
+    const currentOwner = room.locks.get(normalizedShapeId);
+
+    if (currentOwner !== socket.id) return;
+
+    room.locks.delete(normalizedShapeId);
+
+    socket.to(normalizedRoomId).emit("shape-unlocked", {
+      shapeId: normalizedShapeId
+    });
+  });
+
   socket.on("disconnect", () => {
+    releaseSocketLocks(socket);
     console.log("Používateľ odpojený:", socket.id);
   });
 });
