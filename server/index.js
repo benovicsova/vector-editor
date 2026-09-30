@@ -7,6 +7,10 @@ const app = express();
 
 app.use(cors());
 
+app.get("/", (req, res) => {
+  res.send("Vector editor backend beží.");
+});
+
 const server = createServer(app);
 
 const io = new Server(server, {
@@ -26,14 +30,21 @@ function getRoom(roomId) {
   return rooms.get(String(roomId || "").trim());
 }
 
+function getLockedShapes(room) {
+  return Array.from(room.locks.entries()).map(([shapeId, lock]) => ({
+    shapeId,
+    userName: lock.userName
+  }));
+}
+
 function releaseSocketLocks(socket) {
   for (const [roomId, room] of rooms.entries()) {
     if (!room?.locks) continue;
 
     const releasedShapeIds = [];
 
-    for (const [shapeId, socketId] of room.locks.entries()) {
-      if (socketId === socket.id) {
+    for (const [shapeId, lock] of room.locks.entries()) {
+      if (lock.socketId === socket.id) {
         room.locks.delete(shapeId);
         releasedShapeIds.push(shapeId);
       }
@@ -50,16 +61,19 @@ function releaseSocketLocks(socket) {
 io.on("connection", (socket) => {
   console.log("Používateľ pripojený:", socket.id);
 
-  socket.on("create-room", ({ shapes }, callback) => {
+  socket.on("create-room", ({ shapes, userName }, callback) => {
     let roomId = generateRoomId();
 
     while (rooms.has(roomId)) {
       roomId = generateRoomId();
     }
 
+    const normalizedUserName = String(userName || "Používateľ").trim();
+
     rooms.set(roomId, {
       shapes: Array.isArray(shapes) ? shapes : [],
-      locks: new Map()
+      locks: new Map(),
+      users: new Map([[socket.id, normalizedUserName]])
     });
 
     socket.join(roomId);
@@ -68,14 +82,15 @@ io.on("connection", (socket) => {
       success: true,
       roomId,
       shapes: rooms.get(roomId).shapes,
-      lockedShapeIds: []
+      lockedShapes: []
     });
 
     console.log(`Miestnosť vytvorená: ${roomId}`);
   });
 
-  socket.on("join-room", ({ roomId }, callback) => {
+  socket.on("join-room", ({ roomId, userName }, callback) => {
     const normalizedRoomId = String(roomId || "").trim();
+    const normalizedUserName = String(userName || "Používateľ").trim();
 
     if (!/^\d{4}$/.test(normalizedRoomId)) {
       callback({
@@ -95,17 +110,18 @@ io.on("connection", (socket) => {
       return;
     }
 
+    room.users.set(socket.id, normalizedUserName);
     socket.join(normalizedRoomId);
 
     callback({
       success: true,
       roomId: normalizedRoomId,
       shapes: room.shapes,
-      lockedShapeIds: Array.from(room.locks.keys())
+      lockedShapes: getLockedShapes(room)
     });
 
     console.log(
-      `Používateľ ${socket.id} sa pripojil do miestnosti ${normalizedRoomId}`
+      `Používateľ ${socket.id} (${normalizedUserName}) sa pripojil do miestnosti ${normalizedRoomId}`
     );
   });
 
@@ -123,9 +139,14 @@ io.on("connection", (socket) => {
     });
   });
 
-  socket.on("shape-lock", ({ roomId, shapeId }, callback) => {
+  socket.on("shape-lock", ({ roomId, shapeId, userName }, callback) => {
     const normalizedRoomId = String(roomId || "").trim();
     const normalizedShapeId = String(shapeId || "").trim();
+    const normalizedUserName =
+      String(userName || "").trim() ||
+      getRoom(normalizedRoomId)?.users?.get(socket.id) ||
+      "Používateľ";
+
     const room = getRoom(normalizedRoomId);
 
     if (!room || !normalizedShapeId) {
@@ -136,20 +157,24 @@ io.on("connection", (socket) => {
       return;
     }
 
-    const currentOwner = room.locks.get(normalizedShapeId);
+    const currentLock = room.locks.get(normalizedShapeId);
 
-    if (currentOwner && currentOwner !== socket.id) {
+    if (currentLock && currentLock.socketId !== socket.id) {
       callback?.({
         success: false,
-        message: "Tento tvar práve upravuje iný používateľ."
+        message: `Tento tvar práve upravuje ${currentLock.userName}.`
       });
       return;
     }
 
-    room.locks.set(normalizedShapeId, socket.id);
+    room.locks.set(normalizedShapeId, {
+      socketId: socket.id,
+      userName: normalizedUserName
+    });
 
     socket.to(normalizedRoomId).emit("shape-locked", {
-      shapeId: normalizedShapeId
+      shapeId: normalizedShapeId,
+      userName: normalizedUserName
     });
 
     callback?.({
@@ -165,9 +190,9 @@ io.on("connection", (socket) => {
 
     if (!room || !normalizedShapeId) return;
 
-    const currentOwner = room.locks.get(normalizedShapeId);
+    const currentLock = room.locks.get(normalizedShapeId);
 
-    if (currentOwner !== socket.id) return;
+    if (!currentLock || currentLock.socketId !== socket.id) return;
 
     room.locks.delete(normalizedShapeId);
 
@@ -178,6 +203,11 @@ io.on("connection", (socket) => {
 
   socket.on("disconnect", () => {
     releaseSocketLocks(socket);
+
+    for (const room of rooms.values()) {
+      room.users?.delete(socket.id);
+    }
+
     console.log("Používateľ odpojený:", socket.id);
   });
 });

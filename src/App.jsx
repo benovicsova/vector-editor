@@ -1,5 +1,17 @@
 import { useEffect, useRef, useState } from "react";
 import { io } from "socket.io-client";
+import {
+  Eye,
+  EyeOff,
+  Copy,
+  Trash2,
+  BringToFront,
+  SendToBack,
+  ChevronsUp,
+  ChevronsDown,
+  PanelRightClose,
+  PanelRightOpen
+} from "lucide-react";
 
 import { CANVAS_WIDTH, CANVAS_HEIGHT, TOOL } from "./constants";
 import { initialShapes } from "./data/initialShapes";
@@ -14,7 +26,7 @@ const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || "http://localhost:3001";
 const DEFAULT_PROJECT_NAME = "projekt-vektor-editor";
 
 export default function App() {
-  const [tool, setTool] = useState(TOOL.SELECT);
+  const [tool, setTool] = useState(TOOL.RECT);
 
   const [history, setHistory] = useState([initialShapes]);
   const [historyIndex, setHistoryIndex] = useState(0);
@@ -27,7 +39,11 @@ export default function App() {
   const [stroke, setStroke] = useState("#1f2937");
   const [strokeWidth, setStrokeWidth] = useState(4);
 
+  const [fontFamily, setFontFamily] = useState("Arial");
+  const [fontSize, setFontSize] = useState(32);
+
   const [projectName, setProjectName] = useState("");
+  const [userName, setUserName] = useState("");
 
   const [zoom, setZoom] = useState(1);
 
@@ -36,11 +52,13 @@ export default function App() {
 
   const [roomId, setRoomId] = useState("");
   const [connectionStatus, setConnectionStatus] = useState("offline");
-  const [lockedShapeIds, setLockedShapeIds] = useState([]);
+  const [lockedShapes, setLockedShapes] = useState([]);
 
   const [roomModal, setRoomModal] = useState(null);
   const [joinInput, setJoinInput] = useState("");
   const [roomError, setRoomError] = useState("");
+
+  const [showObjectsPanel, setShowObjectsPanel] = useState(true);
 
   const socketRef = useRef(null);
   const roomIdRef = useRef("");
@@ -48,8 +66,17 @@ export default function App() {
   const dragInfoRef = useRef(dragInfo);
   const historyRef = useRef(history);
   const historyIndexRef = useRef(historyIndex);
+  const clipboardRef = useRef(null);
 
   const selectedShape = shapes.find((shape) => shape.id === selectedId) ?? null;
+
+  const panelShapes = shapes.filter((shape) => {
+    if (dragInfo?.mode === "pen-draw" && shape.id === dragInfo.shapeId) {
+      return false;
+    }
+
+    return true;
+  });
 
   useEffect(() => {
     shapesRef.current = shapes;
@@ -65,6 +92,15 @@ export default function App() {
       setFill(selectedShape.stroke || "#1f2937");
       setStroke(selectedShape.stroke || "#1f2937");
       setStrokeWidth(selectedShape.strokeWidth || 4);
+      return;
+    }
+
+    if (selectedShape.type === "text") {
+      setFill(selectedShape.fill || selectedShape.stroke || "#1f2937");
+      setStroke(selectedShape.stroke || "#1f2937");
+      setStrokeWidth(selectedShape.strokeWidth || 4);
+      setFontFamily(selectedShape.fontFamily || "Arial");
+      setFontSize(selectedShape.fontSize || 32);
       return;
     }
 
@@ -84,7 +120,7 @@ export default function App() {
 
     socket.on("disconnect", () => {
       setConnectionStatus("offline");
-      setLockedShapeIds([]);
+      setLockedShapes([]);
     });
 
     socket.on("canvas-update", ({ shapes: remoteShapes }) => {
@@ -96,7 +132,9 @@ export default function App() {
       let nextShapes = remoteShapes;
 
       if (localEditingShapeId) {
-        const localShape = localShapes.find((shape) => shape.id === localEditingShapeId);
+        const localShape = localShapes.find(
+          (shape) => shape.id === localEditingShapeId
+        );
 
         if (localShape) {
           const remoteHasShape = remoteShapes.some(
@@ -120,14 +158,22 @@ export default function App() {
       );
     });
 
-    socket.on("shape-locked", ({ shapeId }) => {
-      setLockedShapeIds((prev) =>
-        prev.includes(shapeId) ? prev : [...prev, shapeId]
-      );
+    socket.on("shape-locked", ({ shapeId, userName }) => {
+      setLockedShapes((prev) => {
+        if (prev.some((item) => item.shapeId === shapeId)) return prev;
+
+        return [
+          ...prev,
+          {
+            shapeId,
+            userName: userName || "Používateľ"
+          }
+        ];
+      });
     });
 
     socket.on("shape-unlocked", ({ shapeId }) => {
-      setLockedShapeIds((prev) => prev.filter((id) => id !== shapeId));
+      setLockedShapes((prev) => prev.filter((item) => item.shapeId !== shapeId));
     });
 
     return () => {
@@ -168,6 +214,26 @@ export default function App() {
         return;
       }
 
+      if (ctrlOrMeta && key === "d") {
+        event.preventDefault();
+        duplicateSelected();
+        return;
+      }
+
+      if (ctrlOrMeta && key === "c") {
+        if (!selectedShape) return;
+
+        event.preventDefault();
+        clipboardRef.current = structuredClone(selectedShape);
+        return;
+      }
+
+      if (ctrlOrMeta && key === "v") {
+        event.preventDefault();
+        pasteShape();
+        return;
+      }
+
       if (event.key === "Delete" || event.key === "Backspace") {
         if (!selectedId) return;
 
@@ -181,7 +247,19 @@ export default function App() {
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [selectedId, lockedShapeIds]);
+  }, [selectedId, lockedShapes, selectedShape]);
+
+  function getCurrentUserName() {
+    return userName.trim() || "Používateľ";
+  }
+
+  function isShapeLocked(shapeId) {
+    return lockedShapes.some((item) => item.shapeId === shapeId);
+  }
+
+  function getShapeLock(shapeId) {
+    return lockedShapes.find((item) => item.shapeId === shapeId) ?? null;
+  }
 
   function syncShapes(nextShapes) {
     if (!roomIdRef.current) return;
@@ -245,8 +323,10 @@ export default function App() {
       return;
     }
 
-    if (lockedShapeIds.includes(shapeId)) {
-      setRoomError("Tento tvar práve upravuje iný používateľ.");
+    const existingLock = getShapeLock(shapeId);
+
+    if (existingLock) {
+      setRoomError(`Tento tvar práve upravuje ${existingLock.userName}.`);
       setRoomModal({ type: "error" });
       return;
     }
@@ -255,11 +335,14 @@ export default function App() {
       "shape-lock",
       {
         roomId: roomIdRef.current,
-        shapeId
+        shapeId,
+        userName: getCurrentUserName()
       },
       (response) => {
         if (!response?.success) {
-          setRoomError(response?.message || "Tento tvar práve upravuje iný používateľ.");
+          setRoomError(
+            response?.message || "Tento tvar práve upravuje iný používateľ."
+          );
           setRoomModal({ type: "error" });
           return;
         }
@@ -281,7 +364,7 @@ export default function App() {
 
   function updateSelectedShapeStyle(property, value) {
     if (!selectedId) return;
-    if (lockedShapeIds.includes(selectedId)) return;
+    if (isShapeLocked(selectedId)) return;
 
     lockShape(selectedId, () => {
       setShapesDirect((prev) =>
@@ -297,11 +380,38 @@ export default function App() {
             };
           }
 
+          if (shape.type === "text" && property === "stroke") {
+            return {
+              ...shape,
+              stroke: value
+            };
+          }
+
           return {
             ...shape,
             [property]: value
           };
         })
+      );
+
+      unlockShape(selectedId);
+    });
+  }
+
+  function updateSelectedTextTypography(property, value) {
+    if (!selectedId || selectedShape?.type !== "text") return;
+    if (isShapeLocked(selectedId)) return;
+
+    lockShape(selectedId, () => {
+      setShapesDirect((prev) =>
+        prev.map((shape) =>
+          shape.id === selectedId
+            ? {
+                ...shape,
+                [property]: value
+              }
+            : shape
+        )
       );
 
       unlockShape(selectedId);
@@ -325,8 +435,40 @@ export default function App() {
     updateSelectedShapeStyle("strokeWidth", normalizedStrokeWidth);
   }
 
+  function handleFontFamilyChange(nextFontFamily) {
+    setFontFamily(nextFontFamily);
+    updateSelectedTextTypography("fontFamily", nextFontFamily);
+  }
+
+  function handleFontSizeChange(nextFontSize) {
+    const normalizedFontSize = Math.max(8, Number(nextFontSize) || 8);
+
+    setFontSize(normalizedFontSize);
+    updateSelectedTextTypography("fontSize", normalizedFontSize);
+  }
+
+  function askForUserNameIfNeeded() {
+    const current = userName.trim();
+
+    if (current) return current;
+
+    const entered = window.prompt("Zadaj svoje meno:", "Používateľ");
+
+    if (!entered) return "";
+
+    const normalized = entered.trim();
+
+    if (!normalized) return "";
+
+    setUserName(normalized);
+    return normalized;
+  }
+
   function createRoom() {
     setRoomError("");
+
+    const normalizedUserName = askForUserNameIfNeeded();
+    if (!normalizedUserName) return;
 
     if (!socketRef.current) {
       setRoomError("Server nie je dostupný.");
@@ -334,25 +476,35 @@ export default function App() {
       return;
     }
 
-    socketRef.current.emit("create-room", { shapes }, (response) => {
-      if (!response?.success) {
-        setRoomError("Miestnosť sa nepodarilo vytvoriť.");
-        setRoomModal({ type: "error" });
-        return;
+    socketRef.current.emit(
+      "create-room",
+      {
+        shapes,
+        userName: normalizedUserName
+      },
+      (response) => {
+        if (!response?.success) {
+          setRoomError("Miestnosť sa nepodarilo vytvoriť.");
+          setRoomModal({ type: "error" });
+          return;
+        }
+
+        setRoomId(response.roomId);
+        roomIdRef.current = response.roomId;
+        setLockedShapes(response.lockedShapes ?? []);
+
+        setRoomModal({
+          type: "created",
+          roomId: response.roomId
+        });
       }
-
-      setRoomId(response.roomId);
-      roomIdRef.current = response.roomId;
-      setLockedShapeIds(response.lockedShapeIds ?? []);
-
-      setRoomModal({
-        type: "created",
-        roomId: response.roomId
-      });
-    });
+    );
   }
 
   function openJoinRoomModal() {
+    const normalizedUserName = askForUserNameIfNeeded();
+    if (!normalizedUserName) return;
+
     setJoinInput("");
     setRoomError("");
     setRoomModal({ type: "join" });
@@ -360,6 +512,9 @@ export default function App() {
 
   function joinRoom() {
     const normalizedRoomId = joinInput.trim();
+    const normalizedUserName = askForUserNameIfNeeded();
+
+    if (!normalizedUserName) return;
 
     setRoomError("");
 
@@ -373,29 +528,42 @@ export default function App() {
       return;
     }
 
-    socketRef.current.emit("join-room", { roomId: normalizedRoomId }, (response) => {
-      if (!response?.success) {
-        setRoomError(response?.message || "Nepodarilo sa pripojiť k miestnosti.");
-        return;
+    socketRef.current.emit(
+      "join-room",
+      {
+        roomId: normalizedRoomId,
+        userName: normalizedUserName
+      },
+      (response) => {
+        if (!response?.success) {
+          setRoomError(response?.message || "Nepodarilo sa pripojiť k miestnosti.");
+          return;
+        }
+
+        const confirmJoin = window.confirm(
+          `Naozaj sa chceš pripojiť do miestnosti ${response.roomId}?`
+        );
+
+        if (!confirmJoin) return;
+
+        setRoomId(response.roomId);
+        roomIdRef.current = response.roomId;
+        setLockedShapes(response.lockedShapes ?? []);
+
+        if (Array.isArray(response.shapes)) {
+          setHistory([response.shapes]);
+          setHistoryIndex(0);
+          setSelectedId(null);
+          setDraft(null);
+          setDragInfo(null);
+        }
+
+        setRoomModal({
+          type: "joined",
+          roomId: response.roomId
+        });
       }
-
-      setRoomId(response.roomId);
-      roomIdRef.current = response.roomId;
-      setLockedShapeIds(response.lockedShapeIds ?? []);
-
-      if (Array.isArray(response.shapes)) {
-        setHistory([response.shapes]);
-        setHistoryIndex(0);
-        setSelectedId(null);
-        setDraft(null);
-        setDragInfo(null);
-      }
-
-      setRoomModal({
-        type: "joined",
-        roomId: response.roomId
-      });
-    });
+    );
   }
 
   function closeRoomModal() {
@@ -445,40 +613,82 @@ export default function App() {
 
   function duplicateSelected() {
     if (!selectedShape) return;
-    if (lockedShapeIds.includes(selectedShape.id)) return;
+    duplicateShapeById(selectedShape.id);
+  }
 
-    lockShape(selectedShape.id, () => {
-      const copy = duplicateShape(selectedShape);
+  function duplicateShapeById(shapeId) {
+    const shape = shapesRef.current.find((item) => item.id === shapeId);
+    if (!shape) return;
+    if (isShapeLocked(shapeId)) return;
+
+    clipboardRef.current = structuredClone(shape);
+
+    lockShape(shapeId, () => {
+      const copy = {
+        ...duplicateShape(shape),
+        name: shape.name ? `${shape.name} kópia` : undefined
+      };
+
       const nextShapes = [...shapesRef.current, copy];
 
       setShapesDirect(nextShapes);
       setSelectedId(copy.id);
-      unlockShape(selectedShape.id);
+      setTool(TOOL.SELECT);
+      unlockShape(shapeId);
     });
+  }
+
+  function pasteShape() {
+    if (!clipboardRef.current) return;
+
+    const copy = duplicateShape(clipboardRef.current);
+    const nextShapes = [...shapesRef.current, copy];
+
+    clipboardRef.current = structuredClone(copy);
+
+    setShapesDirect(nextShapes);
+    setSelectedId(copy.id);
   }
 
   function deleteSelected() {
     if (!selectedId) return;
-    if (lockedShapeIds.includes(selectedId)) return;
+    deleteShapeById(selectedId);
+  }
 
-    lockShape(selectedId, () => {
-      setShapesDirect((prev) => prev.filter((shape) => shape.id !== selectedId));
-      unlockShape(selectedId);
-      setSelectedId(null);
+  function deleteShapeById(shapeId) {
+    if (!shapeId) return;
+    if (isShapeLocked(shapeId)) return;
+
+    lockShape(shapeId, () => {
+      setShapesDirect((prev) => prev.filter((shape) => shape.id !== shapeId));
+      unlockShape(shapeId);
+
+      if (selectedId === shapeId) {
+        setSelectedId(null);
+      }
     });
   }
 
   function moveLayer(direction) {
     if (!selectedShape) return;
-    if (lockedShapeIds.includes(selectedShape.id)) return;
+    moveLayerById(selectedShape.id, direction);
+  }
 
-    lockShape(selectedShape.id, () => {
+  function moveLayerById(shapeId, direction) {
+    if (!shapeId) return;
+    if (isShapeLocked(shapeId)) return;
+
+    const previousSelectedId = shapeId;
+
+    lockShape(shapeId, () => {
       const currentShapes = shapesRef.current;
-      const index = currentShapes.findIndex((shape) => shape.id === selectedShape.id);
+      const index = currentShapes.findIndex((shape) => shape.id === shapeId);
       const swapIndex = direction === "up" ? index + 1 : index - 1;
 
       if (swapIndex < 0 || swapIndex >= currentShapes.length) {
-        unlockShape(selectedShape.id);
+        unlockShape(shapeId);
+        setSelectedId(previousSelectedId);
+        setTool(TOOL.SELECT);
         return;
       }
 
@@ -486,23 +696,127 @@ export default function App() {
       [next[index], next[swapIndex]] = [next[swapIndex], next[index]];
 
       setShapesDirect(next);
-      unlockShape(selectedShape.id);
+
+      requestAnimationFrame(() => {
+        setSelectedId(previousSelectedId);
+        setTool(TOOL.SELECT);
+      });
+
+      unlockShape(shapeId);
+    });
+  }
+
+  function moveLayerToExtreme(direction) {
+    if (!selectedShape) return;
+    moveLayerToExtremeById(selectedShape.id, direction);
+  }
+
+  function moveLayerToExtremeById(shapeId, direction) {
+    if (!shapeId) return;
+    if (isShapeLocked(shapeId)) return;
+
+    const previousSelectedId = shapeId;
+
+    lockShape(shapeId, () => {
+      const currentShapes = [...shapesRef.current];
+      const index = currentShapes.findIndex((shape) => shape.id === shapeId);
+
+      if (index < 0) {
+        unlockShape(shapeId);
+        setSelectedId(previousSelectedId);
+        setTool(TOOL.SELECT);
+        return;
+      }
+
+      const [item] = currentShapes.splice(index, 1);
+
+      if (direction === "front") {
+        currentShapes.push(item);
+      } else {
+        currentShapes.unshift(item);
+      }
+
+      setShapesDirect(currentShapes);
+
+      requestAnimationFrame(() => {
+        setSelectedId(previousSelectedId);
+        setTool(TOOL.SELECT);
+      });
+
+      unlockShape(shapeId);
     });
   }
 
   function toggleVisible() {
     if (!selectedShape) return;
-    if (lockedShapeIds.includes(selectedShape.id)) return;
+    toggleShapeVisibleFromPanel(selectedShape.id);
 
-    lockShape(selectedShape.id, () => {
+    if (selectedShape.visible !== false) {
+      setSelectedId(null);
+      setShowObjectsPanel(true);
+    }
+  }
+
+  function toggleShapeVisibleFromPanel(shapeId) {
+    const shape = shapesRef.current.find((item) => item.id === shapeId);
+    if (!shape) return;
+    if (isShapeLocked(shapeId)) return;
+
+    lockShape(shapeId, () => {
       setShapesDirect((prev) =>
-        prev.map((shape) =>
-          shape.id === selectedShape.id ? { ...shape, visible: !shape.visible } : shape
+        prev.map((item) =>
+          item.id === shapeId ? { ...item, visible: item.visible === false } : item
         )
       );
 
-      unlockShape(selectedShape.id);
+      requestAnimationFrame(() => {
+        setSelectedId(shapeId);
+        setTool(TOOL.SELECT);
+      });
+
+      unlockShape(shapeId);
     });
+  }
+
+  function renameShapeFromPanel(shapeId, nextName) {
+    setShapesLive((prev) =>
+      prev.map((shape) =>
+        shape.id === shapeId
+          ? {
+              ...shape,
+              name: nextName
+            }
+          : shape
+      )
+    );
+  }
+
+  function selectShapeFromPanel(shapeId) {
+    const shape = shapesRef.current.find((item) => item.id === shapeId);
+    if (!shape) return;
+
+    if (shape.visible === false) {
+      setShapesDirect((prev) =>
+        prev.map((item) =>
+          item.id === shapeId ? { ...item, visible: true } : item
+        )
+      );
+    }
+
+    setSelectedId(shapeId);
+    setTool(TOOL.SELECT);
+  }
+
+  function getShapeDefaultLabel(shape, index) {
+    const number = index + 1;
+
+    if (shape.type === "rect") return `Obdĺžnik ${number}`;
+    if (shape.type === "ellipse") return `Elipsa ${number}`;
+    if (shape.type === "triangle") return `Trojuholník ${number}`;
+    if (shape.type === "pen") return `Čiara ${number}`;
+    if (shape.type === "text") return `Text ${number}`;
+
+    return `Objekt ${number}`;
   }
 
   function pointsToPath(points) {
@@ -588,6 +902,12 @@ export default function App() {
 
     if (shape.type === "pen") {
       return `<path d="${pointsToPath(shape.points)}" fill="none" stroke="${escapeXml(strokeValue)}" stroke-width="${strokeWidthValue}" stroke-linejoin="round" stroke-linecap="round" />`;
+    }
+
+    if (shape.type === "text") {
+      const textFill = shape.fill && shape.fill !== "none" ? shape.fill : strokeValue;
+
+      return `<text x="${shape.x}" y="${shape.y}" fill="${escapeXml(textFill)}" font-size="${shape.fontSize || 32}" font-family="${escapeXml(shape.fontFamily || "Arial")}" font-weight="700">${escapeXml(shape.text || "")}</text>`;
     }
 
     return "";
@@ -732,8 +1052,14 @@ export default function App() {
         setStroke={handleStrokeChange}
         strokeWidth={strokeWidth}
         setStrokeWidth={handleStrokeWidthChange}
+        fontFamily={fontFamily}
+        setFontFamily={handleFontFamilyChange}
+        fontSize={fontSize}
+        setFontSize={handleFontSizeChange}
         projectName={projectName}
         setProjectName={setProjectName}
+        userName={userName}
+        setUserName={setUserName}
         onExportPng={handleExportPng}
         onExportJson={handleExportJson}
         onImportJson={handleImportJson}
@@ -746,6 +1072,8 @@ export default function App() {
         onDelete={deleteSelected}
         onMoveForward={() => moveLayer("up")}
         onMoveBackward={() => moveLayer("down")}
+        onBringToFront={() => moveLayerToExtreme("front")}
+        onSendToBack={() => moveLayerToExtreme("back")}
         onToggleVisible={toggleVisible}
         zoom={zoom}
         onZoomIn={zoomIn}
@@ -755,7 +1083,146 @@ export default function App() {
         onCreateRoom={createRoom}
         onJoinRoom={openJoinRoomModal}
         connectionStatus={connectionStatus}
+        showObjectsPanel={showObjectsPanel}
+        onToggleObjectsPanel={() => setShowObjectsPanel((prev) => !prev)}
       />
+
+      <button
+        className={
+          showObjectsPanel
+            ? "objects-side-toggle open"
+            : "objects-side-toggle closed"
+        }
+        type="button"
+        onClick={() => setShowObjectsPanel((prev) => !prev)}
+        title={showObjectsPanel ? "Skryť panel objektov" : "Zobraziť panel objektov"}
+      >
+        {showObjectsPanel ? <PanelRightClose /> : <PanelRightOpen />}
+      </button>
+
+      <aside
+        className={
+          showObjectsPanel ? "objects-panel open" : "objects-panel collapsed"
+        }
+      >
+        <div className="objects-panel-header">
+          <strong>Objekty a vrstvy</strong>
+
+          <button
+            className="objects-panel-close"
+            type="button"
+            onClick={() => setShowObjectsPanel(false)}
+            title="Skryť panel"
+          >
+            ×
+          </button>
+        </div>
+
+        {panelShapes.length === 0 && (
+          <div className="objects-empty">Zatiaľ tu nie sú žiadne objekty.</div>
+        )}
+
+        <div className="objects-list">
+          {panelShapes
+            .map((shape, index) => ({ shape, index }))
+            .reverse()
+            .map(({ shape, index }) => (
+              <div
+                key={shape.id}
+                className={
+                  selectedId === shape.id
+                    ? "objects-item selected"
+                    : "objects-item"
+                }
+              >
+                <button
+                  className="objects-thumbnail-button"
+                  type="button"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    selectShapeFromPanel(shape.id);
+                  }}
+                  title="Vybrať objekt"
+                >
+                  <ShapeThumbnail shape={shape} />
+                </button>
+
+                <input
+                  className="objects-rename-input"
+                  value={shape.name ?? getShapeDefaultLabel(shape, index)}
+                  onChange={(event) =>
+                    renameShapeFromPanel(shape.id, event.target.value)
+                  }
+                  onFocus={(event) => {
+                    event.stopPropagation();
+                    setSelectedId(shape.id);
+                    setTool(TOOL.SELECT);
+                  }}
+                  title="Premenovať objekt"
+                />
+
+                <div
+                  className="objects-actions-row"
+                  onMouseDown={(event) => event.stopPropagation()}
+                  onClick={(event) => event.stopPropagation()}
+                >
+                  <MiniButton
+                    title="Skryť / zobraziť"
+                    active={shape.visible !== false}
+                    onClick={() => toggleShapeVisibleFromPanel(shape.id)}
+                  >
+                    {shape.visible === false ? <EyeOff /> : <Eye />}
+                  </MiniButton>
+
+                  <MiniButton
+                    title="Duplikovať"
+                    onClick={() => duplicateShapeById(shape.id)}
+                  >
+                    <Copy />
+                  </MiniButton>
+
+                  <MiniButton
+                    title="Vymazať"
+                    danger
+                    onClick={() => deleteShapeById(shape.id)}
+                  >
+                    <Trash2 />
+                  </MiniButton>
+
+                  <MiniDivider />
+
+                  <MiniButton
+                    title="O 1 dopredu"
+                    onClick={() => moveLayerById(shape.id, "up")}
+                  >
+                    <BringToFront />
+                  </MiniButton>
+
+                  <MiniButton
+                    title="O 1 dozadu"
+                    onClick={() => moveLayerById(shape.id, "down")}
+                  >
+                    <SendToBack />
+                  </MiniButton>
+
+                  <MiniButton
+                    title="Úplne dopredu"
+                    onClick={() => moveLayerToExtremeById(shape.id, "front")}
+                  >
+                    <ChevronsUp />
+                  </MiniButton>
+
+                  <MiniButton
+                    title="Úplne dozadu"
+                    onClick={() => moveLayerToExtremeById(shape.id, "back")}
+                  >
+                    <ChevronsDown />
+                  </MiniButton>
+                </div>
+              </div>
+            ))}
+        </div>
+      </aside>
 
       <EditorCanvas
         tool={tool}
@@ -768,13 +1235,15 @@ export default function App() {
         fill={fill}
         stroke={stroke}
         strokeWidth={strokeWidth}
+        fontFamily={fontFamily}
+        fontSize={fontSize}
         draft={draft}
         setDraft={setDraft}
         dragInfo={dragInfo}
         setDragInfo={setDragInfo}
         zoom={zoom}
         setZoom={setZoom}
-        lockedShapeIds={lockedShapeIds}
+        lockedShapes={lockedShapes}
         lockShape={lockShape}
         unlockShape={unlockShape}
       />
@@ -867,6 +1336,163 @@ export default function App() {
       )}
     </div>
   );
+}
+
+function MiniButton({ title, onClick, children, active, danger }) {
+  return (
+    <button
+      className={[
+        "objects-mini-button",
+        active ? "active" : "",
+        danger ? "danger" : ""
+      ].join(" ")}
+      type="button"
+      title={title}
+      onMouseDown={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+      }}
+      onClick={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        onClick?.();
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+function MiniDivider() {
+  return <span className="objects-mini-divider" />;
+}
+
+function ShapeThumbnail({ shape }) {
+  const box = getBoundingBox(shape);
+
+  const padding = Math.max(Number(shape.strokeWidth) || 2, 2) + 10;
+  const viewX = box.x - padding;
+  const viewY = box.y - padding;
+  const viewW = Math.max(box.w + padding * 2, 1);
+  const viewH = Math.max(box.h + padding * 2, 1);
+
+  const stroke = shape.stroke || "#1f2937";
+  const fill = shape.fill || "none";
+  const strokeWidth = Math.max(Number(shape.strokeWidth) || 1, 1);
+  const rotation = Number(shape.rotation) || 0;
+  const center = {
+    x: box.x + box.w / 2,
+    y: box.y + box.h / 2
+  };
+
+  return (
+    <svg
+      className="objects-thumbnail"
+      viewBox={`${viewX} ${viewY} ${viewW} ${viewH}`}
+      preserveAspectRatio="xMidYMid meet"
+    >
+      <rect
+        x={viewX}
+        y={viewY}
+        width={viewW}
+        height={viewH}
+        fill="white"
+      />
+
+      <g transform={`rotate(${rotation} ${center.x} ${center.y})`}>
+        {shape.type === "rect" && (
+          <rect
+            x={Math.min(shape.x, shape.x + shape.w)}
+            y={Math.min(shape.y, shape.y + shape.h)}
+            width={Math.abs(shape.w)}
+            height={Math.abs(shape.h)}
+            fill={fill}
+            stroke={stroke}
+            strokeWidth={strokeWidth}
+          />
+        )}
+
+        {shape.type === "ellipse" && (
+          <ellipse
+            cx={shape.x + shape.w / 2}
+            cy={shape.y + shape.h / 2}
+            rx={Math.abs(shape.w / 2)}
+            ry={Math.abs(shape.h / 2)}
+            fill={fill}
+            stroke={stroke}
+            strokeWidth={strokeWidth}
+          />
+        )}
+
+        {shape.type === "triangle" && (
+          <polygon
+            points={shape.points.map((point) => `${point.x},${point.y}`).join(" ")}
+            fill={fill}
+            stroke={stroke}
+            strokeWidth={strokeWidth}
+            strokeLinejoin="round"
+            strokeLinecap="round"
+          />
+        )}
+
+        {shape.type === "pen" && (
+          <path
+            d={pointsToThumbnailPath(shape.points)}
+            fill="none"
+            stroke={stroke}
+            strokeWidth={strokeWidth}
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        )}
+
+        {shape.type === "text" && (
+          <text
+            x={shape.x}
+            y={shape.y}
+            fill={shape.fill && shape.fill !== "none" ? shape.fill : stroke}
+            fontSize={shape.fontSize || 32}
+            fontFamily={shape.fontFamily || "Arial"}
+            fontWeight="700"
+          >
+            {shape.text || "Text"}
+          </text>
+        )}
+      </g>
+
+      {shape.visible === false && (
+        <rect
+          x={viewX}
+          y={viewY}
+          width={viewW}
+          height={viewH}
+          fill="rgba(255,255,255,0.68)"
+        />
+      )}
+    </svg>
+  );
+}
+
+function pointsToThumbnailPath(points) {
+  if (!points || points.length === 0) return "";
+  if (points.length === 1) return `M ${points[0].x} ${points[0].y}`;
+
+  let path = `M ${points[0].x} ${points[0].y}`;
+
+  for (let i = 1; i < points.length - 1; i++) {
+    const current = points[i];
+    const next = points[i + 1];
+
+    const midX = (current.x + next.x) / 2;
+    const midY = (current.y + next.y) / 2;
+
+    path += ` Q ${current.x} ${current.y} ${midX} ${midY}`;
+  }
+
+  const last = points[points.length - 1];
+  path += ` L ${last.x} ${last.y}`;
+
+  return path;
 }
 
 const modalStyles = {

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { CANVAS_WIDTH, CANVAS_HEIGHT, TOOL } from "../constants";
 import {
@@ -13,6 +13,15 @@ import ShapeRenderer from "./ShapeRenderer";
 
 const ERASER_RADIUS = 22;
 const MIN_SHAPE_SIZE = 4;
+
+const FONT_OPTIONS = [
+  "Arial",
+  "Verdana",
+  "Tahoma",
+  "Georgia",
+  "Times New Roman",
+  "Courier New"
+];
 
 function distanceToSegment(point, a, b) {
   const dx = b.x - a.x;
@@ -37,6 +46,8 @@ function distanceToSegment(point, a, b) {
 }
 
 function isPointNearPolyline(point, points, radius) {
+  if (!points || points.length === 0) return false;
+
   if (points.length === 1) {
     return distance(point, points[0]) <= radius;
   }
@@ -72,6 +83,17 @@ function isPointInsidePolygon(point, points) {
 function eraserTouchesShape(point, shape, radius) {
   if (shape.type === "pen") {
     return isPointNearPolyline(point, shape.points, radius + shape.strokeWidth / 2);
+  }
+
+  if (shape.type === "text") {
+    const box = getBoundingBox(shape);
+
+    return (
+      point.x >= box.x - radius &&
+      point.x <= box.x + box.w + radius &&
+      point.y >= box.y - radius &&
+      point.y <= box.y + box.h + radius
+    );
   }
 
   if (shape.type === "triangle") {
@@ -170,6 +192,82 @@ function isDraftLargeEnough(draft) {
   return true;
 }
 
+function getShapeCenter(shape) {
+  const box = getBoundingBox(shape);
+
+  return {
+    x: box.x + box.w / 2,
+    y: box.y + box.h / 2
+  };
+}
+
+function getAngle(center, point) {
+  return (Math.atan2(point.y - center.y, point.x - center.x) * 180) / Math.PI;
+}
+
+function rotatePoint(point, center, angleDegrees) {
+  const angle = (angleDegrees * Math.PI) / 180;
+  const cos = Math.cos(angle);
+  const sin = Math.sin(angle);
+
+  const dx = point.x - center.x;
+  const dy = point.y - center.y;
+
+  return {
+    x: center.x + dx * cos - dy * sin,
+    y: center.y + dx * sin + dy * cos
+  };
+}
+
+function unrotatePoint(point, center, angleDegrees) {
+  return rotatePoint(point, center, -angleDegrees);
+}
+
+function getRotation(shape) {
+  return Number(shape?.rotation) || 0;
+}
+
+function createTriangleFromDraft(draft, style) {
+  if (!draft.equilateral) {
+    return createTriangleFromBox(draft.x1, draft.y1, draft.x2, draft.y2, {
+      ...style,
+      rotation: 0
+    });
+  }
+
+  const dx = draft.x2 - draft.x1;
+  const dy = draft.y2 - draft.y1;
+
+  const signX = Math.sign(dx || 1);
+  const signY = Math.sign(dy || 1);
+
+  const sideFromWidth = Math.abs(dx);
+  const sideFromHeight = (Math.abs(dy) * 2) / Math.sqrt(3);
+  const side = Math.max(sideFromWidth, sideFromHeight, 1);
+  const height = (Math.sqrt(3) / 2) * side;
+
+  const x2 = draft.x1 + signX * side;
+  const y2 = draft.y1 + signY * height;
+
+  const left = Math.min(draft.x1, x2);
+  const right = Math.max(draft.x1, x2);
+  const top = Math.min(draft.y1, y2);
+  const bottom = Math.max(draft.y1, y2);
+
+  return {
+    id: uid(),
+    type: "triangle",
+    points: [
+      { x: (left + right) / 2, y: top },
+      { x: right, y: bottom },
+      { x: left, y: bottom }
+    ],
+    visible: true,
+    ...style,
+    rotation: 0
+  };
+}
+
 export default function EditorCanvas({
   tool,
   setTool,
@@ -181,13 +279,15 @@ export default function EditorCanvas({
   fill,
   stroke,
   strokeWidth,
+  fontFamily,
+  fontSize,
   draft,
   setDraft,
   dragInfo,
   setDragInfo,
   zoom,
   setZoom,
-  lockedShapeIds = [],
+  lockedShapes = [],
   lockShape,
   unlockShape
 }) {
@@ -197,9 +297,22 @@ export default function EditorCanvas({
   });
 
   const [eraserPosition, setEraserPosition] = useState(null);
+  const [textEditor, setTextEditor] = useState(null);
+
+  const inputRef = useRef(null);
 
   const selectedShape = shapes.find((s) => s.id === selectedId) ?? null;
   const selectedBounds = selectedShape ? getBoundingBox(selectedShape) : null;
+  const selectedCenter = selectedShape ? getShapeCenter(selectedShape) : null;
+  const selectedRotation = selectedShape ? getRotation(selectedShape) : 0;
+
+  useEffect(() => {
+    if (textEditor && inputRef.current) {
+      setTimeout(() => {
+        inputRef.current?.focus();
+      }, 0);
+    }
+  }, [textEditor]);
 
   const viewBox = useMemo(() => {
     const visibleWidth = CANVAS_WIDTH / zoom;
@@ -216,8 +329,12 @@ export default function EditorCanvas({
 
   const style = { fill, stroke, strokeWidth };
 
+  function getLock(shapeId) {
+    return lockedShapes.find((item) => item.shapeId === shapeId) ?? null;
+  }
+
   function isLocked(shapeId) {
-    return lockedShapeIds.includes(shapeId);
+    return Boolean(getLock(shapeId));
   }
 
   function screenPointToSvgPoint(event, svg) {
@@ -287,16 +404,134 @@ export default function EditorCanvas({
     });
   }
 
-  function startDrawingAt(point) {
+  function openTextEditorForCreate(point) {
+    setTool(TOOL.TEXT);
+    setSelectedId(null);
+
+    setTextEditor({
+      mode: "create",
+      x: point.x,
+      y: point.y,
+      text: "",
+      fontFamily: fontFamily || "Arial",
+      fontSize: fontSize || 32
+    });
+  }
+
+  function openTextEditorForEdit(shape) {
+    if (isLocked(shape.id)) return;
+
+    lockShape?.(shape.id, () => {
+      setTool(TOOL.SELECT);
+      setSelectedId(shape.id);
+
+      setTextEditor({
+        mode: "edit",
+        shapeId: shape.id,
+        x: shape.x,
+        y: shape.y,
+        text: shape.text || "",
+        fontFamily: shape.fontFamily || fontFamily || "Arial",
+        fontSize: shape.fontSize || fontSize || 32
+      });
+    });
+  }
+
+  function commitTextEditor() {
+    if (!textEditor) return;
+
+    const text = textEditor.text.trim();
+
+    if (textEditor.mode === "create") {
+      if (text) {
+        const newShape = {
+          id: uid(),
+          type: "text",
+          text,
+          x: textEditor.x,
+          y: textEditor.y,
+          fill: fill === "none" ? stroke : fill,
+          stroke,
+          strokeWidth,
+          fontFamily: textEditor.fontFamily || "Arial",
+          fontSize: Math.max(8, Number(textEditor.fontSize) || 32),
+          rotation: 0,
+          visible: true
+        };
+
+        setShapes((prev) => [...prev, newShape]);
+        setSelectedId(newShape.id);
+        setTool(TOOL.SELECT);
+      }
+
+      setTextEditor(null);
+      return;
+    }
+
+    if (textEditor.mode === "edit") {
+      if (text) {
+        setShapes((prev) =>
+          prev.map((shape) =>
+            shape.id === textEditor.shapeId
+              ? {
+                  ...shape,
+                  text,
+                  fontFamily: textEditor.fontFamily || "Arial",
+                  fontSize: Math.max(8, Number(textEditor.fontSize) || 32)
+                }
+              : shape
+          )
+        );
+      }
+
+      unlockShape?.(textEditor.shapeId);
+      setTool(TOOL.SELECT);
+      setSelectedId(textEditor.shapeId);
+      setTextEditor(null);
+    }
+  }
+
+  function cancelTextEditor() {
+    if (textEditor?.mode === "edit") {
+      unlockShape?.(textEditor.shapeId);
+      setSelectedId(textEditor.shapeId);
+      setTool(TOOL.SELECT);
+    }
+
+    setTextEditor(null);
+  }
+
+  function startDrawingAt(point, event) {
+    if (tool === TOOL.TEXT) {
+      openTextEditorForCreate(point);
+      return;
+    }
+
     setSelectedId(null);
 
     if (tool === TOOL.RECT) {
-      setDraft({ type: "rect", x: point.x, y: point.y, w: 0, h: 0, ...style });
+      setDraft({
+        type: "rect",
+        x: point.x,
+        y: point.y,
+        w: 0,
+        h: 0,
+        rotation: 0,
+        ...style
+      });
       return;
     }
 
     if (tool === TOOL.ELLIPSE) {
-      setDraft({ type: "ellipse", x: point.x, y: point.y, w: 0, h: 0, ...style });
+      setDraft({
+        type: "ellipse",
+        x: point.x,
+        y: point.y,
+        w: 0,
+        h: 0,
+        rotation: 0,
+        ...style
+      });
       return;
     }
 
@@ -307,6 +542,8 @@ export default function EditorCanvas({
         y1: point.y,
         x2: point.x,
         y2: point.y,
+        equilateral: Boolean(event?.shiftKey),
+        rotation: 0,
         ...style
       });
       return;
@@ -320,6 +557,7 @@ export default function EditorCanvas({
         fill: "none",
         stroke,
         strokeWidth,
+        rotation: 0,
         visible: true
       };
 
@@ -328,7 +566,8 @@ export default function EditorCanvas({
       setDragInfo({
         mode: "pen-draw",
         shapeId: newShape.id,
-        startPoint: point
+        startPoint: point,
+        straight: Boolean(event?.shiftKey)
       });
     }
   }
@@ -358,7 +597,12 @@ export default function EditorCanvas({
       return;
     }
 
-    if (dragInfo?.mode === "move-shape" || dragInfo?.mode === "move-point") {
+    if (
+      dragInfo?.mode === "move-shape" ||
+      dragInfo?.mode === "move-point" ||
+      dragInfo?.mode === "rotate-shape" ||
+      dragInfo?.mode === "scale-shape"
+    ) {
       setShapes((prev) => prev);
 
       if (dragInfo.shapeId) {
@@ -405,6 +649,11 @@ export default function EditorCanvas({
 
     const p = getSvgPoint(event);
 
+    if (textEditor) {
+      commitTextEditor();
+      return;
+    }
+
     if (tool === TOOL.ERASE) {
       setSelectedId(null);
       setEraserPosition(p);
@@ -418,7 +667,7 @@ export default function EditorCanvas({
       return;
     }
 
-    startDrawingAt(p);
+    startDrawingAt(p, event);
   }
 
   function handlePointerMove(event) {
@@ -457,19 +706,12 @@ export default function EditorCanvas({
     }
 
     if (draft?.type === "triangle-box") {
-      setDraft((prev) => {
-        const box = getConstrainedBox(
-          { x: prev.x1, y: prev.y1 },
-          p,
-          event.shiftKey
-        );
-
-        return {
-          ...prev,
-          x2: prev.x1 + box.w,
-          y2: prev.y1 + box.h
-        };
-      });
+      setDraft((prev) => ({
+        ...prev,
+        x2: p.x,
+        y2: p.y,
+        equilateral: event.shiftKey
+      }));
 
       return;
     }
@@ -479,7 +721,7 @@ export default function EditorCanvas({
         prev.map((shape) => {
           if (shape.id !== dragInfo.shapeId) return shape;
 
-          if (event.shiftKey && dragInfo.startPoint) {
+          if (event.shiftKey || dragInfo.straight) {
             return {
               ...shape,
               points: [dragInfo.startPoint, p]
@@ -487,11 +729,60 @@ export default function EditorCanvas({
           }
 
           const last = shape.points[shape.points.length - 1];
-          if (last && distance(last, p) < 25) return shape;
 
-          return { ...shape, points: [...shape.points, p] };
+          if (last && distance(last, p) < 7) return shape;
+
+          return {
+            ...shape,
+            points: [...shape.points, p]
+          };
         })
       );
+
+      return;
+    }
+
+    if (dragInfo?.mode === "rotate-shape") {
+      const currentAngle = getAngle(dragInfo.center, p);
+      const delta = currentAngle - dragInfo.startAngle;
+      const nextRotation = dragInfo.originalRotation + delta;
+
+      setShapesLive((prev) =>
+        prev.map((shape) =>
+          shape.id === dragInfo.shapeId
+            ? {
+                ...shape,
+                rotation: nextRotation
+              }
+            : shape
+        )
+      );
+
+      return;
+    }
+
+    if (dragInfo?.mode === "scale-shape") {
+      const localPoint = unrotatePoint(p, dragInfo.center, dragInfo.rotation);
+      const currentDistance = Math.max(distance(dragInfo.center, localPoint), 1);
+      const scale = currentDistance / dragInfo.startDistance;
+
+      setShapesLive((prev) =>
+        prev.map((shape) => {
+          if (shape.id !== dragInfo.shapeId) return shape;
+
+          if (shape.type !== "triangle") return shape;
+
+          return {
+            ...shape,
+            points: dragInfo.originalPoints.map((point) => ({
+              x: dragInfo.center.x + (point.x - dragInfo.center.x) * scale,
+              y: dragInfo.center.y + (point.y - dragInfo.center.y) * scale
+            }))
+          };
+        })
+      );
+
+      return;
     }
 
     if (dragInfo?.mode === "move-shape") {
@@ -510,6 +801,14 @@ export default function EditorCanvas({
             };
           }
 
+          if (shape.type === "text") {
+            return {
+              ...shape,
+              x: dragInfo.original.x + dx,
+              y: dragInfo.original.y + dy
+            };
+          }
+
           return {
             ...shape,
             points: dragInfo.originalPoints.map((pt) => ({
@@ -519,6 +818,8 @@ export default function EditorCanvas({
           };
         })
       );
+
+      return;
     }
 
     if (dragInfo?.mode === "move-point") {
@@ -526,11 +827,17 @@ export default function EditorCanvas({
         prev.map((shape) => {
           if (shape.id !== dragInfo.shapeId) return shape;
 
+          const localPoint = unrotatePoint(
+            p,
+            dragInfo.center,
+            dragInfo.rotation
+          );
+
           if (shape.type === "rect" || shape.type === "ellipse") {
             const next = { ...shape };
             const anchor = dragInfo.anchor;
 
-            const box = getConstrainedBox(anchor, p, event.shiftKey);
+            const box = getConstrainedBox(anchor, localPoint, event.shiftKey);
 
             next.x = anchor.x;
             next.y = anchor.y;
@@ -540,10 +847,23 @@ export default function EditorCanvas({
             return next;
           }
 
+          if (shape.type === "text") {
+            return {
+              ...shape,
+              x: localPoint.x,
+              y: localPoint.y
+            };
+          }
+
           return {
             ...shape,
             points: shape.points.map((pt, i) =>
-              i === dragInfo.pointIndex ? { x: p.x, y: p.y } : pt
+              i === dragInfo.pointIndex
+                ? {
+                    x: localPoint.x,
+                    y: localPoint.y
+                  }
+                : pt
             )
           };
         })
@@ -553,7 +873,7 @@ export default function EditorCanvas({
 
   function handlePointerUp() {
     const hadDraft = Boolean(draft);
-    const wasPenDrawing = dragInfo?.mode === "pen-draw";
+    const wasDrawing = dragInfo?.mode === "pen-draw";
     const wasErasing = dragInfo?.mode === "erase";
 
     if (draft?.type === "rect" && isDraftLargeEnough(draft)) {
@@ -577,19 +897,45 @@ export default function EditorCanvas({
     }
 
     if (draft?.type === "triangle-box" && isDraftLargeEnough(draft)) {
-      const shape = createTriangleFromBox(draft.x1, draft.y1, draft.x2, draft.y2, style);
+      const shape = createTriangleFromDraft(draft, style);
 
       setShapes((prev) => [...prev, shape]);
     }
 
     finishActiveEdit();
 
-    if (hadDraft || wasPenDrawing || wasErasing) {
+    if (hadDraft || wasDrawing || wasErasing) {
       setSelectedId(null);
     }
 
     setDraft(null);
     setDragInfo(null);
+  }
+
+  function isDrawingTool() {
+    return (
+      tool === TOOL.RECT ||
+      tool === TOOL.ELLIPSE ||
+      tool === TOOL.TRIANGLE ||
+      tool === TOOL.PEN ||
+      tool === TOOL.TEXT
+    );
+  }
+
+  function handleShapeDoubleClick(event, shape) {
+    event.stopPropagation();
+    event.preventDefault();
+
+    if (textEditor) {
+      commitTextEditor();
+    }
+
+    if (shape.type === "text") {
+      openTextEditorForEdit(shape);
+      return;
+    }
+
+    focusShape(shape);
   }
 
   function handleShapePointerDown(event, shape) {
@@ -600,19 +946,19 @@ export default function EditorCanvas({
       return;
     }
 
-    if (event.detail >= 2) {
-      focusShape(shape);
+    if (textEditor) {
+      commitTextEditor();
       return;
     }
 
-    if (
-      tool === TOOL.RECT ||
-      tool === TOOL.ELLIPSE ||
-      tool === TOOL.TRIANGLE ||
-      tool === TOOL.PEN
-    ) {
+    if (event.detail >= 2) {
+      handleShapeDoubleClick(event, shape);
+      return;
+    }
+
+    if (isDrawingTool()) {
       const p = getPointerFromSvg(event);
-      startDrawingAt(p);
+      startDrawingAt(p, event);
       return;
     }
 
@@ -632,6 +978,15 @@ export default function EditorCanvas({
               return {
                 ...item,
                 stroke: fill
+              };
+            }
+
+            if (item.type === "text") {
+              if (fill === "none") return item;
+
+              return {
+                ...item,
+                fill
               };
             }
 
@@ -672,22 +1027,36 @@ export default function EditorCanvas({
           mode: "move-shape",
           shapeId: shape.id,
           start: p,
-          original: { x: shape.x, y: shape.y }
+          original: {
+            x: shape.x,
+            y: shape.y
+          }
         });
-      } else {
+
+        return;
+      }
+
+      if (shape.type === "text") {
         setDragInfo({
           mode: "move-shape",
           shapeId: shape.id,
           start: p,
-          originalPoints: shape.points.map((pt) => ({ ...pt }))
+          original: {
+            x: shape.x,
+            y: shape.y
+          }
         });
-      }
-    });
-  }
 
-  function handleShapeDoubleClick(event, shape) {
-    event.stopPropagation();
-    focusShape(shape);
+        return;
+      }
+
+      setDragInfo({
+        mode: "move-shape",
+        shapeId: shape.id,
+        start: p,
+        originalPoints: shape.points.map((pt) => ({ ...pt }))
+      });
+    });
   }
 
   function getEditPoints(shape) {
@@ -707,7 +1076,20 @@ export default function EditorCanvas({
       ];
     }
 
+    if (shape.type === "text") {
+      return [{ x: shape.x, y: shape.y }];
+    }
+
     return shape.points;
+  }
+
+  function getTriangleScalePoint(shape) {
+    const box = getBoundingBox(shape);
+
+    return {
+      x: box.x + box.w + 30 / zoom,
+      y: box.y + box.h + 30 / zoom
+    };
   }
 
   function startPointDrag(event, shape, pointIndex) {
@@ -715,6 +1097,9 @@ export default function EditorCanvas({
 
     if (tool !== TOOL.SELECT) return;
     if (isLocked(shape.id)) return;
+
+    const center = getShapeCenter(shape);
+    const rotation = getRotation(shape);
 
     lockShape?.(shape.id, () => {
       setSelectedId(shape.id);
@@ -733,15 +1118,70 @@ export default function EditorCanvas({
           mode: "move-point",
           shapeId: shape.id,
           pointIndex,
-          anchor: points[oppositePointMap[pointIndex]]
+          anchor: points[oppositePointMap[pointIndex]],
+          center,
+          rotation
         });
-      } else {
-        setDragInfo({
-          mode: "move-point",
-          shapeId: shape.id,
-          pointIndex
-        });
+
+        return;
       }
+
+      setDragInfo({
+        mode: "move-point",
+        shapeId: shape.id,
+        pointIndex,
+        center,
+        rotation
+      });
+    });
+  }
+
+  function startRotationDrag(event, shape) {
+    event.stopPropagation();
+
+    if (tool !== TOOL.SELECT) return;
+    if (isLocked(shape.id)) return;
+
+    const p = getPointerFromSvg(event);
+    const center = getShapeCenter(shape);
+
+    lockShape?.(shape.id, () => {
+      setSelectedId(shape.id);
+
+      setDragInfo({
+        mode: "rotate-shape",
+        shapeId: shape.id,
+        center,
+        startAngle: getAngle(center, p),
+        originalRotation: getRotation(shape)
+      });
+    });
+  }
+
+  function startScaleDrag(event, shape) {
+    event.stopPropagation();
+
+    if (tool !== TOOL.SELECT) return;
+    if (isLocked(shape.id)) return;
+    if (shape.type !== "triangle") return;
+
+    const center = getShapeCenter(shape);
+    const rotation = getRotation(shape);
+    const p = getPointerFromSvg(event);
+    const localPoint = unrotatePoint(p, center, rotation);
+    const startDistance = Math.max(distance(center, localPoint), 1);
+
+    lockShape?.(shape.id, () => {
+      setSelectedId(shape.id);
+
+      setDragInfo({
+        mode: "scale-shape",
+        shapeId: shape.id,
+        center,
+        rotation,
+        startDistance,
+        originalPoints: shape.points.map((pt) => ({ ...pt }))
+      });
     });
   }
 
@@ -768,34 +1208,50 @@ export default function EditorCanvas({
           fill="white"
         />
 
-        {shapes.map((shape) =>
-          shape.visible ? (
+        {shapes.map((shape) => {
+          if (!shape.visible) return null;
+
+          const lock = getLock(shape.id);
+
+          return (
             <g
               key={shape.id}
               onDoubleClick={(event) => handleShapeDoubleClick(event, shape)}
             >
               <ShapeRenderer
                 shape={shape}
-                selected={shape.id === selectedId}
-                locked={isLocked(shape.id)}
+                locked={Boolean(lock)}
                 onPointerDown={(e) => handleShapePointerDown(e, shape)}
               />
+
+              {lock && (
+                <text
+                  x={getBoundingBox(shape).x}
+                  y={getBoundingBox(shape).y - 10}
+                  fill="#ef4444"
+                  fontSize={16 / zoom}
+                  fontWeight="700"
+                  pointerEvents="none"
+                >
+                  {lock.userName}
+                </text>
+              )}
             </g>
-          ) : null
-        )}
+          );
+        })}
 
         {draft?.type === "rect" && <ShapeRenderer shape={draft} preview />}
         {draft?.type === "ellipse" && <ShapeRenderer shape={draft} preview />}
 
         {draft?.type === "triangle-box" && (
           <ShapeRenderer
-            shape={createTriangleFromBox(draft.x1, draft.y1, draft.x2, draft.y2, style)}
+            shape={createTriangleFromDraft(draft, style)}
             preview
           />
         )}
 
-        {selectedShape && selectedBounds && tool === TOOL.SELECT && (
-          <>
+        {selectedShape && selectedBounds && selectedCenter && tool === TOOL.SELECT && (
+          <g transform={`rotate(${selectedRotation} ${selectedCenter.x} ${selectedCenter.y})`}>
             <rect
               x={selectedBounds.x - 6}
               y={selectedBounds.y - 6}
@@ -806,6 +1262,40 @@ export default function EditorCanvas({
               strokeDasharray="8 6"
               strokeWidth={2 / zoom}
             />
+
+            <line
+              x1={selectedBounds.x + selectedBounds.w / 2}
+              y1={selectedBounds.y - 6}
+              x2={selectedBounds.x + selectedBounds.w / 2}
+              y2={selectedBounds.y - 42 / zoom}
+              stroke="#855cd6"
+              strokeWidth={2 / zoom}
+              strokeDasharray={`${5 / zoom} ${4 / zoom}`}
+            />
+
+            <circle
+              cx={selectedBounds.x + selectedBounds.w / 2}
+              cy={selectedBounds.y - 48 / zoom}
+              r={10 / zoom}
+              fill="#855cd6"
+              stroke="white"
+              strokeWidth={3 / zoom}
+              className="rotate-point"
+              onPointerDown={(event) => startRotationDrag(event, selectedShape)}
+            />
+
+            {selectedShape.type === "triangle" && (
+              <circle
+                cx={getTriangleScalePoint(selectedShape).x}
+                cy={getTriangleScalePoint(selectedShape).y}
+                r={10 / zoom}
+                fill="#f97316"
+                stroke="white"
+                strokeWidth={3 / zoom}
+                className="scale-point"
+                onPointerDown={(event) => startScaleDrag(event, selectedShape)}
+              />
+            )}
 
             {getEditPoints(selectedShape).map((p, index) => (
               <circle
@@ -820,7 +1310,103 @@ export default function EditorCanvas({
                 onPointerDown={(e) => startPointDrag(e, selectedShape, index)}
               />
             ))}
-          </>
+          </g>
+        )}
+
+        {textEditor && (
+          <foreignObject
+            x={textEditor.x}
+            y={textEditor.y - textEditor.fontSize - 90}
+            width={360}
+            height={textEditor.fontSize + 135}
+          >
+            <div
+              xmlns="http://www.w3.org/1999/xhtml"
+              className="svg-text-editor"
+              onMouseDown={(event) => event.stopPropagation()}
+              onPointerDown={(event) => event.stopPropagation()}
+            >
+              <div className="text-editor-row">
+                <input
+                  ref={inputRef}
+                  className="svg-text-input"
+                  value={textEditor.text}
+                  onChange={(event) =>
+                    setTextEditor((prev) => ({
+                      ...prev,
+                      text: event.target.value
+                    }))
+                  }
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      commitTextEditor();
+                    }
+
+                    if (event.key === "Escape") {
+                      event.preventDefault();
+                      cancelTextEditor();
+                    }
+                  }}
+                  style={{
+                    fontFamily: textEditor.fontFamily,
+                    fontSize: `${textEditor.fontSize}px`,
+                    color: fill === "none" ? stroke : fill
+                  }}
+                  placeholder="Napíš text..."
+                />
+              </div>
+
+              <div className="text-editor-row">
+                <select
+                  className="svg-text-select"
+                  value={textEditor.fontFamily}
+                  onChange={(event) =>
+                    setTextEditor((prev) => ({
+                      ...prev,
+                      fontFamily: event.target.value
+                    }))
+                  }
+                >
+                  {FONT_OPTIONS.map((font) => (
+                    <option key={font} value={font}>
+                      {font}
+                    </option>
+                  ))}
+                </select>
+
+                <input
+                  className="svg-text-size"
+                  type="number"
+                  min="8"
+                  max="180"
+                  value={textEditor.fontSize}
+                  onChange={(event) =>
+                    setTextEditor((prev) => ({
+                      ...prev,
+                      fontSize: Math.max(8, Number(event.target.value) || 8)
+                    }))
+                  }
+                />
+
+                <button
+                  className="svg-text-confirm"
+                  type="button"
+                  onClick={commitTextEditor}
+                >
+                  OK
+                </button>
+
+                <button
+                  className="svg-text-cancel"
+                  type="button"
+                  onClick={cancelTextEditor}
+                >
+                  ×
+                </button>
+              </div>
+            </div>
+          </foreignObject>
         )}
 
         {tool === TOOL.ERASE && eraserPosition && (
