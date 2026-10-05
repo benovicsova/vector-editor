@@ -1,271 +1,39 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useState } from "react";
 
 import { CANVAS_WIDTH, CANVAS_HEIGHT, TOOL } from "../constants";
+import { clamp, distance, getBoundingBox, uid } from "../utils/geometry";
 import {
-  clamp,
-  distance,
-  getBoundingBox,
-  createTriangleFromBox,
-  uid
-} from "../utils/geometry";
+  ERASER_RADIUS,
+  constrainLinePoint,
+  createQuadFromDraft,
+  createTriangleFromDraft,
+  eraserTouchesShape,
+  getAngle,
+  getBoundsForShapes,
+  getBoundsCenter,
+  getConstrainedBox,
+  getEditPoints,
+  getRotation,
+  getShapeCenter,
+  isClosedPen,
+  isDraftLargeEnough,
+  moveShapeByDelta,
+  scaleShapeFromCenter,
+  shapeIntersectsBounds,
+  unrotatePoint
+} from "../utils/editorCanvasGeometry";
 
 import ShapeRenderer from "./ShapeRenderer";
+import EditorCanvasSelectionControls from "./EditorCanvasSelectionControls";
+import EditorCanvasTextEditor from "./EditorCanvasTextEditor";
 
-const ERASER_RADIUS = 22;
-const MIN_SHAPE_SIZE = 4;
+function normalizeBounds(start, current) {
+  const x = Math.min(start.x, current.x);
+  const y = Math.min(start.y, current.y);
+  const w = Math.abs(current.x - start.x);
+  const h = Math.abs(current.y - start.y);
 
-const FONT_OPTIONS = [
-  "Arial",
-  "Verdana",
-  "Tahoma",
-  "Georgia",
-  "Times New Roman",
-  "Courier New"
-];
-
-function distanceToSegment(point, a, b) {
-  const dx = b.x - a.x;
-  const dy = b.y - a.y;
-
-  if (dx === 0 && dy === 0) {
-    return distance(point, a);
-  }
-
-  const t = clamp(
-    ((point.x - a.x) * dx + (point.y - a.y) * dy) / (dx * dx + dy * dy),
-    0,
-    1
-  );
-
-  const projection = {
-    x: a.x + t * dx,
-    y: a.y + t * dy
-  };
-
-  return distance(point, projection);
-}
-
-function isPointNearPolyline(point, points, radius) {
-  if (!points || points.length === 0) return false;
-
-  if (points.length === 1) {
-    return distance(point, points[0]) <= radius;
-  }
-
-  for (let i = 0; i < points.length - 1; i++) {
-    if (distanceToSegment(point, points[i], points[i + 1]) <= radius) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-function isPointInsidePolygon(point, points) {
-  let inside = false;
-
-  for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
-    const xi = points[i].x;
-    const yi = points[i].y;
-    const xj = points[j].x;
-    const yj = points[j].y;
-
-    const intersect =
-      yi > point.y !== yj > point.y &&
-      point.x < ((xj - xi) * (point.y - yi)) / (yj - yi) + xi;
-
-    if (intersect) inside = !inside;
-  }
-
-  return inside;
-}
-
-function eraserTouchesShape(point, shape, radius) {
-  if (shape.type === "pen") {
-    return isPointNearPolyline(point, shape.points, radius + shape.strokeWidth / 2);
-  }
-
-  if (shape.type === "text") {
-    const box = getBoundingBox(shape);
-
-    return (
-      point.x >= box.x - radius &&
-      point.x <= box.x + box.w + radius &&
-      point.y >= box.y - radius &&
-      point.y <= box.y + box.h + radius
-    );
-  }
-
-  if (shape.type === "triangle") {
-    const closedPoints = [...shape.points, shape.points[0]];
-
-    if (shape.fill !== "none" && isPointInsidePolygon(point, shape.points)) {
-      return true;
-    }
-
-    return isPointNearPolyline(point, closedPoints, radius + shape.strokeWidth / 2);
-  }
-
-  if (shape.type === "rect") {
-    const box = getBoundingBox(shape);
-
-    const insideExpandedBox =
-      point.x >= box.x - radius &&
-      point.x <= box.x + box.w + radius &&
-      point.y >= box.y - radius &&
-      point.y <= box.y + box.h + radius;
-
-    if (!insideExpandedBox) return false;
-
-    if (shape.fill !== "none") return true;
-
-    const edges = [
-      [{ x: box.x, y: box.y }, { x: box.x + box.w, y: box.y }],
-      [{ x: box.x + box.w, y: box.y }, { x: box.x + box.w, y: box.y + box.h }],
-      [{ x: box.x + box.w, y: box.y + box.h }, { x: box.x, y: box.y + box.h }],
-      [{ x: box.x, y: box.y + box.h }, { x: box.x, y: box.y }]
-    ];
-
-    return edges.some(([a, b]) =>
-      distanceToSegment(point, a, b) <= radius + shape.strokeWidth / 2
-    );
-  }
-
-  if (shape.type === "ellipse") {
-    const box = getBoundingBox(shape);
-    const cx = box.x + box.w / 2;
-    const cy = box.y + box.h / 2;
-    const rx = Math.max(box.w / 2, 1);
-    const ry = Math.max(box.h / 2, 1);
-
-    const normalized =
-      ((point.x - cx) * (point.x - cx)) / ((rx + radius) * (rx + radius)) +
-      ((point.y - cy) * (point.y - cy)) / ((ry + radius) * (ry + radius));
-
-    if (normalized > 1) return false;
-
-    if (shape.fill !== "none") return true;
-
-    const outline =
-      ((point.x - cx) * (point.x - cx)) / (rx * rx) +
-      ((point.y - cy) * (point.y - cy)) / (ry * ry);
-
-    return Math.abs(outline - 1) < 0.25;
-  }
-
-  return false;
-}
-
-function getConstrainedBox(start, current, shouldConstrain) {
-  const dx = current.x - start.x;
-  const dy = current.y - start.y;
-
-  if (!shouldConstrain) {
-    return {
-      w: dx,
-      h: dy
-    };
-  }
-
-  const size = Math.max(Math.abs(dx), Math.abs(dy));
-
-  return {
-    w: Math.sign(dx || 1) * size,
-    h: Math.sign(dy || 1) * size
-  };
-}
-
-function isDraftLargeEnough(draft) {
-  if (!draft) return false;
-
-  if (draft.type === "rect" || draft.type === "ellipse") {
-    return Math.abs(draft.w) >= MIN_SHAPE_SIZE || Math.abs(draft.h) >= MIN_SHAPE_SIZE;
-  }
-
-  if (draft.type === "triangle-box") {
-    return (
-      Math.abs(draft.x2 - draft.x1) >= MIN_SHAPE_SIZE ||
-      Math.abs(draft.y2 - draft.y1) >= MIN_SHAPE_SIZE
-    );
-  }
-
-  return true;
-}
-
-function getShapeCenter(shape) {
-  const box = getBoundingBox(shape);
-
-  return {
-    x: box.x + box.w / 2,
-    y: box.y + box.h / 2
-  };
-}
-
-function getAngle(center, point) {
-  return (Math.atan2(point.y - center.y, point.x - center.x) * 180) / Math.PI;
-}
-
-function rotatePoint(point, center, angleDegrees) {
-  const angle = (angleDegrees * Math.PI) / 180;
-  const cos = Math.cos(angle);
-  const sin = Math.sin(angle);
-
-  const dx = point.x - center.x;
-  const dy = point.y - center.y;
-
-  return {
-    x: center.x + dx * cos - dy * sin,
-    y: center.y + dx * sin + dy * cos
-  };
-}
-
-function unrotatePoint(point, center, angleDegrees) {
-  return rotatePoint(point, center, -angleDegrees);
-}
-
-function getRotation(shape) {
-  return Number(shape?.rotation) || 0;
-}
-
-function createTriangleFromDraft(draft, style) {
-  if (!draft.equilateral) {
-    return createTriangleFromBox(draft.x1, draft.y1, draft.x2, draft.y2, {
-      ...style,
-      rotation: 0
-    });
-  }
-
-  const dx = draft.x2 - draft.x1;
-  const dy = draft.y2 - draft.y1;
-
-  const signX = Math.sign(dx || 1);
-  const signY = Math.sign(dy || 1);
-
-  const sideFromWidth = Math.abs(dx);
-  const sideFromHeight = (Math.abs(dy) * 2) / Math.sqrt(3);
-  const side = Math.max(sideFromWidth, sideFromHeight, 1);
-  const height = (Math.sqrt(3) / 2) * side;
-
-  const x2 = draft.x1 + signX * side;
-  const y2 = draft.y1 + signY * height;
-
-  const left = Math.min(draft.x1, x2);
-  const right = Math.max(draft.x1, x2);
-  const top = Math.min(draft.y1, y2);
-  const bottom = Math.max(draft.y1, y2);
-
-  return {
-    id: uid(),
-    type: "triangle",
-    points: [
-      { x: (left + right) / 2, y: top },
-      { x: right, y: bottom },
-      { x: left, y: bottom }
-    ],
-    visible: true,
-    ...style,
-    rotation: 0
-  };
+  return { x, y, w, h };
 }
 
 export default function EditorCanvas({
@@ -276,6 +44,8 @@ export default function EditorCanvas({
   setShapesLive,
   selectedId,
   setSelectedId,
+  selectedIds = [],
+  setSelectedIds,
   fill,
   stroke,
   strokeWidth,
@@ -288,6 +58,7 @@ export default function EditorCanvas({
   zoom,
   setZoom,
   lockedShapes = [],
+  focusedShapes = [],
   lockShape,
   unlockShape
 }) {
@@ -299,20 +70,34 @@ export default function EditorCanvas({
   const [eraserPosition, setEraserPosition] = useState(null);
   const [textEditor, setTextEditor] = useState(null);
 
-  const inputRef = useRef(null);
+  const updateShapesLive = setShapesLive || setShapes;
 
-  const selectedShape = shapes.find((s) => s.id === selectedId) ?? null;
+  const normalizedSelectedIds = useMemo(() => {
+    const ids = new Set();
+
+    for (const id of selectedIds) {
+      if (shapes.some((shape) => shape.id === id)) ids.add(id);
+    }
+
+    if (selectedId && shapes.some((shape) => shape.id === selectedId)) {
+      ids.add(selectedId);
+    }
+
+    return Array.from(ids);
+  }, [selectedId, selectedIds, shapes]);
+
+  const selectedShape = shapes.find((shape) => shape.id === selectedId) ?? null;
   const selectedBounds = selectedShape ? getBoundingBox(selectedShape) : null;
   const selectedCenter = selectedShape ? getShapeCenter(selectedShape) : null;
   const selectedRotation = selectedShape ? getRotation(selectedShape) : 0;
 
-  useEffect(() => {
-    if (textEditor && inputRef.current) {
-      setTimeout(() => {
-        inputRef.current?.focus();
-      }, 0);
-    }
-  }, [textEditor]);
+  const multipleSelectedShapes = normalizedSelectedIds
+    .map((id) => shapes.find((shape) => shape.id === id))
+    .filter(Boolean);
+
+  const multiSelectionBounds = getBoundsForShapes(
+    multipleSelectedShapes.length > 1 ? multipleSelectedShapes : []
+  );
 
   const viewBox = useMemo(() => {
     const visibleWidth = CANVAS_WIDTH / zoom;
@@ -329,12 +114,50 @@ export default function EditorCanvas({
 
   const style = { fill, stroke, strokeWidth };
 
+  function setSelection(nextIds) {
+    const uniqueIds = Array.from(
+      new Set(nextIds.filter((id) => shapes.some((shape) => shape.id === id)))
+    );
+
+    setSelectedIds?.(uniqueIds);
+    setSelectedId(uniqueIds[0] || null);
+  }
+
+  function clearSelection() {
+    setSelectedIds?.([]);
+    setSelectedId(null);
+  }
+
+  function prepareLiveHistoryStep() {
+    setShapes((prev) => prev);
+  }
+
+  function withShapeLock(shapeId, callback) {
+    if (!lockShape) {
+      callback();
+      return;
+    }
+
+    lockShape(shapeId, (response) => {
+      if (response === false || response?.success === false) return;
+      callback();
+    });
+  }
+
   function getLock(shapeId) {
     return lockedShapes.find((item) => item.shapeId === shapeId) ?? null;
   }
 
+  function getFocus(shapeId) {
+    return focusedShapes.find((item) => item.shapeId === shapeId) ?? null;
+  }
+
   function isLocked(shapeId) {
     return Boolean(getLock(shapeId));
+  }
+
+  function anyLocked(shapeIds = []) {
+    return shapeIds.some((shapeId) => isLocked(shapeId));
   }
 
   function screenPointToSvgPoint(event, svg) {
@@ -361,7 +184,7 @@ export default function EditorCanvas({
   }
 
   function eraseAt(point) {
-    setShapes((prev) =>
+    updateShapesLive((prev) =>
       prev.filter((shape) => {
         if (isLocked(shape.id)) return true;
         return !eraserTouchesShape(point, shape, ERASER_RADIUS / zoom);
@@ -406,7 +229,7 @@ export default function EditorCanvas({
 
   function openTextEditorForCreate(point) {
     setTool(TOOL.TEXT);
-    setSelectedId(null);
+    clearSelection();
 
     setTextEditor({
       mode: "create",
@@ -421,9 +244,9 @@ export default function EditorCanvas({
   function openTextEditorForEdit(shape) {
     if (isLocked(shape.id)) return;
 
-    lockShape?.(shape.id, () => {
+    withShapeLock(shape.id, () => {
       setTool(TOOL.SELECT);
-      setSelectedId(shape.id);
+      setSelection([shape.id]);
 
       setTextEditor({
         mode: "edit",
@@ -460,7 +283,7 @@ export default function EditorCanvas({
         };
 
         setShapes((prev) => [...prev, newShape]);
-        setSelectedId(newShape.id);
+        setSelection([newShape.id]);
         setTool(TOOL.SELECT);
       }
 
@@ -486,7 +309,7 @@ export default function EditorCanvas({
 
       unlockShape?.(textEditor.shapeId);
       setTool(TOOL.SELECT);
-      setSelectedId(textEditor.shapeId);
+      setSelection([textEditor.shapeId]);
       setTextEditor(null);
     }
   }
@@ -494,7 +317,7 @@ export default function EditorCanvas({
   function cancelTextEditor() {
     if (textEditor?.mode === "edit") {
       unlockShape?.(textEditor.shapeId);
-      setSelectedId(textEditor.shapeId);
+      setSelection([textEditor.shapeId]);
       setTool(TOOL.SELECT);
     }
 
@@ -507,31 +330,15 @@ export default function EditorCanvas({
       return;
     }
 
-    setSelectedId(null);
+    clearSelection();
 
     if (tool === TOOL.RECT) {
-      setDraft({
-        type: "rect",
-        x: point.x,
-        y: point.y,
-        w: 0,
-        h: 0,
-        rotation: 0,
-        ...style
-      });
+      setDraft({ type: "rect", x: point.x, y: point.y, w: 0, h: 0, rotation: 0, ...style });
       return;
     }
 
     if (tool === TOOL.ELLIPSE) {
-      setDraft({
-        type: "ellipse",
-        x: point.x,
-        y: point.y,
-        w: 0,
-        h: 0,
-        rotation: 0,
-        ...style
-      });
+      setDraft({ type: "ellipse", x: point.x, y: point.y, w: 0, h: 0, rotation: 0, ...style });
       return;
     }
 
@@ -549,6 +356,32 @@ export default function EditorCanvas({
       return;
     }
 
+    if (tool === TOOL.QUAD) {
+      setDraft({
+        type: "quad-box",
+        x1: point.x,
+        y1: point.y,
+        x2: point.x,
+        y2: point.y,
+        rotation: 0,
+        ...style
+      });
+      return;
+    }
+
+    if (tool === TOOL.LINE) {
+      setDraft({
+        type: "line",
+        points: [point, point],
+        fill: "none",
+        stroke,
+        strokeWidth,
+        rotation: 0,
+        visible: true
+      });
+      return;
+    }
+
     if (tool === TOOL.PEN) {
       const newShape = {
         id: uid(),
@@ -561,7 +394,8 @@ export default function EditorCanvas({
         visible: true
       };
 
-      setShapes((prev) => [...prev, newShape]);
+      prepareLiveHistoryStep();
+      updateShapesLive((prev) => [...prev, newShape]);
 
       setDragInfo({
         mode: "pen-draw",
@@ -572,19 +406,30 @@ export default function EditorCanvas({
     }
   }
 
-  function focusShape(shape) {
+  function focusShape(shape, append = false) {
     if (isLocked(shape.id)) return;
 
     setTool(TOOL.SELECT);
-    setSelectedId(shape.id);
     setDraft(null);
     setDragInfo(null);
     setEraserPosition(null);
+
+    if (append) {
+      const baseIds = normalizedSelectedIds.length > 0 ? normalizedSelectedIds : selectedId ? [selectedId] : [];
+      const nextIds = baseIds.includes(shape.id)
+        ? baseIds.filter((id) => id !== shape.id)
+        : [...baseIds, shape.id];
+
+      setSelection(nextIds);
+      return;
+    }
+
+    setSelection([shape.id]);
   }
 
   function finishActiveEdit() {
     if (dragInfo?.mode === "pen-draw") {
-      setShapes((prev) => {
+      updateShapesLive((prev) => {
         const shape = prev.find((item) => item.id === dragInfo.shapeId);
 
         if (!shape || shape.points.length < 2) {
@@ -601,12 +446,24 @@ export default function EditorCanvas({
       dragInfo?.mode === "move-shape" ||
       dragInfo?.mode === "move-point" ||
       dragInfo?.mode === "rotate-shape" ||
-      dragInfo?.mode === "scale-shape"
+      dragInfo?.mode === "scale-shape" ||
+      dragInfo?.mode === "move-selection" ||
+      dragInfo?.mode === "scale-selection"
     ) {
-      setShapes((prev) => prev);
+      const idsThatShouldStayLocked = new Set(
+        [selectedId, ...(selectedIds || [])].filter(Boolean)
+      );
 
-      if (dragInfo.shapeId) {
+      if (dragInfo.shapeId && !idsThatShouldStayLocked.has(dragInfo.shapeId)) {
         unlockShape?.(dragInfo.shapeId);
+      }
+
+      if (Array.isArray(dragInfo.shapeIds)) {
+        for (const id of dragInfo.shapeIds) {
+          if (!idsThatShouldStayLocked.has(id)) {
+            unlockShape?.(id);
+          }
+        }
       }
     }
   }
@@ -624,11 +481,7 @@ export default function EditorCanvas({
       y: viewBox.y + mouseRatioY * viewBox.height
     };
 
-    const nextZoom = clamp(
-      zoom * (event.deltaY < 0 ? 1.12 : 0.88),
-      0.2,
-      5
-    );
+    const nextZoom = clamp(zoom * (event.deltaY < 0 ? 1.12 : 0.88), 0.2, 5);
 
     const nextWidth = CANVAS_WIDTH / nextZoom;
     const nextHeight = CANVAS_HEIGHT / nextZoom;
@@ -647,7 +500,7 @@ export default function EditorCanvas({
       return;
     }
 
-    const p = getSvgPoint(event);
+    const point = getSvgPoint(event);
 
     if (textEditor) {
       commitTextEditor();
@@ -655,19 +508,37 @@ export default function EditorCanvas({
     }
 
     if (tool === TOOL.ERASE) {
-      setSelectedId(null);
-      setEraserPosition(p);
+      prepareLiveHistoryStep();
+      clearSelection();
+      setEraserPosition(point);
       setDragInfo({ mode: "erase" });
-      eraseAt(p);
+      eraseAt(point);
       return;
     }
 
-    if (tool === TOOL.SELECT || tool === TOOL.FILL) {
-      setSelectedId(null);
+    if (tool === TOOL.SELECT) {
+      if (!event.ctrlKey && !event.metaKey && !event.shiftKey) {
+        clearSelection();
+      }
+
+      setDragInfo({
+        mode: "select-rect",
+        start: point,
+        current: point,
+        append: event.ctrlKey || event.metaKey || event.shiftKey,
+        originalIds: normalizedSelectedIds
+      });
       return;
     }
 
-    startDrawingAt(p, event);
+    if (tool === TOOL.FILL) {
+      if (!event.ctrlKey && !event.metaKey && !event.shiftKey) {
+        clearSelection();
+      }
+      return;
+    }
+
+    startDrawingAt(point, event);
   }
 
   function handlePointerMove(event) {
@@ -676,167 +547,147 @@ export default function EditorCanvas({
       return;
     }
 
-    const p = getSvgPoint(event);
+    const point = getSvgPoint(event);
 
     if (tool === TOOL.ERASE) {
-      setEraserPosition(p);
+      setEraserPosition(point);
+    }
+
+    if (dragInfo?.mode === "select-rect") {
+      setDragInfo((prev) => ({ ...prev, current: point }));
+      return;
     }
 
     if (dragInfo?.mode === "erase") {
-      eraseAt(p);
+      eraseAt(point);
       return;
     }
 
     if (draft?.type === "rect" || draft?.type === "ellipse") {
       setDraft((prev) => {
-        const box = getConstrainedBox(
-          { x: prev.x, y: prev.y },
-          p,
-          event.shiftKey
-        );
-
-        return {
-          ...prev,
-          w: box.w,
-          h: box.h
-        };
+        const box = getConstrainedBox({ x: prev.x, y: prev.y }, point, event.shiftKey);
+        return { ...prev, w: box.w, h: box.h };
       });
-
       return;
     }
 
     if (draft?.type === "triangle-box") {
+      setDraft((prev) => ({ ...prev, x2: point.x, y2: point.y, equilateral: event.shiftKey }));
+      return;
+    }
+
+    if (draft?.type === "quad-box") {
+      setDraft((prev) => ({ ...prev, x2: point.x, y2: point.y }));
+      return;
+    }
+
+    if (draft?.type === "line") {
       setDraft((prev) => ({
         ...prev,
-        x2: p.x,
-        y2: p.y,
-        equilateral: event.shiftKey
+        points: [prev.points[0], constrainLinePoint(prev.points[0], point, event.shiftKey)]
       }));
-
       return;
     }
 
     if (dragInfo?.mode === "pen-draw") {
-      setShapesLive((prev) =>
+      updateShapesLive((prev) =>
         prev.map((shape) => {
           if (shape.id !== dragInfo.shapeId) return shape;
 
           if (event.shiftKey || dragInfo.straight) {
             return {
               ...shape,
-              points: [dragInfo.startPoint, p]
+              points: [dragInfo.startPoint, constrainLinePoint(dragInfo.startPoint, point, event.shiftKey || dragInfo.straight)]
             };
           }
 
           const last = shape.points[shape.points.length - 1];
+          if (last && distance(last, point) < 7) return shape;
 
-          if (last && distance(last, p) < 7) return shape;
-
-          return {
-            ...shape,
-            points: [...shape.points, p]
-          };
+          return { ...shape, points: [...shape.points, point] };
         })
       );
+      return;
+    }
 
+    if (dragInfo?.mode === "move-selection") {
+      const dx = point.x - dragInfo.start.x;
+      const dy = point.y - dragInfo.start.y;
+
+      updateShapesLive((prev) =>
+        prev.map((shape) => {
+          const original = dragInfo.originalShapes.find((item) => item.id === shape.id);
+          if (!original) return shape;
+          return moveShapeByDelta(original, dx, dy);
+        })
+      );
+      return;
+    }
+
+    if (dragInfo?.mode === "scale-selection") {
+      const currentDistance = Math.max(distance(dragInfo.center, point), 1);
+      const scale = currentDistance / dragInfo.startDistance;
+
+      updateShapesLive((prev) =>
+        prev.map((shape) => {
+          const original = dragInfo.originalShapes.find((item) => item.id === shape.id);
+          if (!original) return shape;
+          return scaleShapeFromCenter(original, dragInfo.center, scale);
+        })
+      );
       return;
     }
 
     if (dragInfo?.mode === "rotate-shape") {
-      const currentAngle = getAngle(dragInfo.center, p);
+      const currentAngle = getAngle(dragInfo.center, point);
       const delta = currentAngle - dragInfo.startAngle;
       const nextRotation = dragInfo.originalRotation + delta;
 
-      setShapesLive((prev) =>
+      updateShapesLive((prev) =>
         prev.map((shape) =>
-          shape.id === dragInfo.shapeId
-            ? {
-                ...shape,
-                rotation: nextRotation
-              }
-            : shape
+          shape.id === dragInfo.shapeId ? { ...shape, rotation: nextRotation } : shape
         )
       );
-
       return;
     }
 
     if (dragInfo?.mode === "scale-shape") {
-      const localPoint = unrotatePoint(p, dragInfo.center, dragInfo.rotation);
+      const localPoint = unrotatePoint(point, dragInfo.center, dragInfo.rotation);
       const currentDistance = Math.max(distance(dragInfo.center, localPoint), 1);
       const scale = currentDistance / dragInfo.startDistance;
 
-      setShapesLive((prev) =>
+      updateShapesLive((prev) =>
         prev.map((shape) => {
           if (shape.id !== dragInfo.shapeId) return shape;
-
-          if (shape.type !== "triangle") return shape;
-
-          return {
-            ...shape,
-            points: dragInfo.originalPoints.map((point) => ({
-              x: dragInfo.center.x + (point.x - dragInfo.center.x) * scale,
-              y: dragInfo.center.y + (point.y - dragInfo.center.y) * scale
-            }))
-          };
+          return scaleShapeFromCenter(dragInfo.originalShape, dragInfo.center, scale);
         })
       );
-
       return;
     }
 
     if (dragInfo?.mode === "move-shape") {
-      const dx = p.x - dragInfo.start.x;
-      const dy = p.y - dragInfo.start.y;
+      const dx = point.x - dragInfo.start.x;
+      const dy = point.y - dragInfo.start.y;
 
-      setShapesLive((prev) =>
+      updateShapesLive((prev) =>
         prev.map((shape) => {
           if (shape.id !== dragInfo.shapeId) return shape;
-
-          if (shape.type === "rect" || shape.type === "ellipse") {
-            return {
-              ...shape,
-              x: dragInfo.original.x + dx,
-              y: dragInfo.original.y + dy
-            };
-          }
-
-          if (shape.type === "text") {
-            return {
-              ...shape,
-              x: dragInfo.original.x + dx,
-              y: dragInfo.original.y + dy
-            };
-          }
-
-          return {
-            ...shape,
-            points: dragInfo.originalPoints.map((pt) => ({
-              x: pt.x + dx,
-              y: pt.y + dy
-            }))
-          };
+          return moveShapeByDelta(dragInfo.originalShape, dx, dy);
         })
       );
-
       return;
     }
 
     if (dragInfo?.mode === "move-point") {
-      setShapesLive((prev) =>
+      updateShapesLive((prev) =>
         prev.map((shape) => {
           if (shape.id !== dragInfo.shapeId) return shape;
 
-          const localPoint = unrotatePoint(
-            p,
-            dragInfo.center,
-            dragInfo.rotation
-          );
+          const localPoint = unrotatePoint(point, dragInfo.center, dragInfo.rotation);
 
           if (shape.type === "rect" || shape.type === "ellipse") {
             const next = { ...shape };
             const anchor = dragInfo.anchor;
-
             const box = getConstrainedBox(anchor, localPoint, event.shiftKey);
 
             next.x = anchor.x;
@@ -848,22 +699,13 @@ export default function EditorCanvas({
           }
 
           if (shape.type === "text") {
-            return {
-              ...shape,
-              x: localPoint.x,
-              y: localPoint.y
-            };
+            return { ...shape, x: localPoint.x, y: localPoint.y };
           }
 
           return {
             ...shape,
-            points: shape.points.map((pt, i) =>
-              i === dragInfo.pointIndex
-                ? {
-                    x: localPoint.x,
-                    y: localPoint.y
-                  }
-                : pt
+            points: shape.points.map((pt, index) =>
+              index === dragInfo.pointIndex ? { x: localPoint.x, y: localPoint.y } : pt
             )
           };
         })
@@ -876,36 +718,49 @@ export default function EditorCanvas({
     const wasDrawing = dragInfo?.mode === "pen-draw";
     const wasErasing = dragInfo?.mode === "erase";
 
-    if (draft?.type === "rect" && isDraftLargeEnough(draft)) {
-      const shape = {
-        id: uid(),
-        visible: true,
-        ...draft
-      };
+    if (dragInfo?.mode === "select-rect") {
+      const selectionBounds = normalizeBounds(dragInfo.start, dragInfo.current);
+      const isClick = selectionBounds.w < 4 / zoom && selectionBounds.h < 4 / zoom;
 
-      setShapes((prev) => [...prev, shape]);
+      if (!isClick) {
+        const idsInside = shapes
+          .filter((shape) => shape.visible !== false)
+          .filter((shape) => !isLocked(shape.id))
+          .filter((shape) => shapeIntersectsBounds(shape, selectionBounds))
+          .map((shape) => shape.id);
+
+        const nextIds = dragInfo.append
+          ? Array.from(new Set([...(dragInfo.originalIds || []), ...idsInside]))
+          : idsInside;
+
+        setSelection(nextIds.filter((shapeId) => !isLocked(shapeId)));
+      }
+    }
+
+    if (draft?.type === "rect" && isDraftLargeEnough(draft)) {
+      setShapes((prev) => [...prev, { id: uid(), visible: true, ...draft }]);
     }
 
     if (draft?.type === "ellipse" && isDraftLargeEnough(draft)) {
-      const shape = {
-        id: uid(),
-        visible: true,
-        ...draft
-      };
-
-      setShapes((prev) => [...prev, shape]);
+      setShapes((prev) => [...prev, { id: uid(), visible: true, ...draft }]);
     }
 
     if (draft?.type === "triangle-box" && isDraftLargeEnough(draft)) {
-      const shape = createTriangleFromDraft(draft, style);
+      setShapes((prev) => [...prev, createTriangleFromDraft(draft, style)]);
+    }
 
-      setShapes((prev) => [...prev, shape]);
+    if (draft?.type === "quad-box" && isDraftLargeEnough(draft)) {
+      setShapes((prev) => [...prev, createQuadFromDraft(draft, style)]);
+    }
+
+    if (draft?.type === "line" && isDraftLargeEnough(draft)) {
+      setShapes((prev) => [...prev, { id: uid(), ...draft }]);
     }
 
     finishActiveEdit();
 
     if (hadDraft || wasDrawing || wasErasing) {
-      setSelectedId(null);
+      clearSelection();
     }
 
     setDraft(null);
@@ -917,6 +772,8 @@ export default function EditorCanvas({
       tool === TOOL.RECT ||
       tool === TOOL.ELLIPSE ||
       tool === TOOL.TRIANGLE ||
+      tool === TOOL.QUAD ||
+      tool === TOOL.LINE ||
       tool === TOOL.PEN ||
       tool === TOOL.TEXT
     );
@@ -928,6 +785,11 @@ export default function EditorCanvas({
 
     if (textEditor) {
       commitTextEditor();
+    }
+
+    if (event.shiftKey || event.ctrlKey || event.metaKey) {
+      focusShape(shape, true);
+      return;
     }
 
     if (shape.type === "text") {
@@ -957,139 +819,92 @@ export default function EditorCanvas({
     }
 
     if (isDrawingTool()) {
-      const p = getPointerFromSvg(event);
-      startDrawingAt(p, event);
+      const point = getPointerFromSvg(event);
+      startDrawingAt(point, event);
       return;
     }
 
-    if (isLocked(shape.id)) {
-      return;
-    }
+    if (isLocked(shape.id)) return;
 
     if (tool === TOOL.FILL) {
-      lockShape?.(shape.id, () => {
+      withShapeLock(shape.id, () => {
         setShapes((prev) =>
           prev.map((item) => {
             if (item.id !== shape.id) return item;
 
             if (item.type === "pen") {
-              if (fill === "none") return item;
+              if (!isClosedPen(item)) {
+                return { ...item, stroke: fill === "none" ? item.stroke : fill };
+              }
 
-              return {
-                ...item,
-                stroke: fill
-              };
+              return { ...item, fill };
+            }
+
+            if (item.type === "line") {
+              if (fill === "none") return item;
+              return { ...item, stroke: fill };
             }
 
             if (item.type === "text") {
               if (fill === "none") return item;
-
-              return {
-                ...item,
-                fill
-              };
+              return { ...item, fill };
             }
 
-            return {
-              ...item,
-              fill
-            };
+            return { ...item, fill };
           })
         );
 
         unlockShape?.(shape.id);
       });
-
       return;
     }
 
     if (tool === TOOL.ERASE) {
-      const p = getPointerFromSvg(event);
+      const point = getPointerFromSvg(event);
 
-      setSelectedId(null);
-      setEraserPosition(p);
+      prepareLiveHistoryStep();
+      clearSelection();
+      setEraserPosition(point);
       setDragInfo({ mode: "erase" });
-      eraseAt(p);
+      eraseAt(point);
       return;
     }
 
-    if (tool !== TOOL.SELECT) {
+    if (tool !== TOOL.SELECT) return;
+
+    if (event.ctrlKey || event.metaKey || event.shiftKey) {
+      focusShape(shape, true);
       return;
     }
 
-    const p = getPointerFromSvg(event);
+    const point = getPointerFromSvg(event);
 
-    lockShape?.(shape.id, () => {
-      setSelectedId(shape.id);
+    if (normalizedSelectedIds.length > 1 && normalizedSelectedIds.includes(shape.id)) {
+      if (anyLocked(normalizedSelectedIds)) return;
 
-      if (shape.type === "rect" || shape.type === "ellipse") {
-        setDragInfo({
-          mode: "move-shape",
-          shapeId: shape.id,
-          start: p,
-          original: {
-            x: shape.x,
-            y: shape.y
-          }
-        });
+      prepareLiveHistoryStep();
+      setDragInfo({
+        mode: "move-selection",
+        shapeIds: normalizedSelectedIds,
+        start: point,
+        originalShapes: shapes
+          .filter((item) => normalizedSelectedIds.includes(item.id))
+          .map((item) => structuredClone(item))
+      });
+      return;
+    }
 
-        return;
-      }
-
-      if (shape.type === "text") {
-        setDragInfo({
-          mode: "move-shape",
-          shapeId: shape.id,
-          start: p,
-          original: {
-            x: shape.x,
-            y: shape.y
-          }
-        });
-
-        return;
-      }
+    withShapeLock(shape.id, () => {
+      setSelection([shape.id]);
+      prepareLiveHistoryStep();
 
       setDragInfo({
         mode: "move-shape",
         shapeId: shape.id,
-        start: p,
-        originalPoints: shape.points.map((pt) => ({ ...pt }))
+        start: point,
+        originalShape: structuredClone(shape)
       });
     });
-  }
-
-  function getEditPoints(shape) {
-    if (!shape) return [];
-
-    if (shape.type === "rect" || shape.type === "ellipse") {
-      const x1 = shape.x;
-      const y1 = shape.y;
-      const x2 = shape.x + shape.w;
-      const y2 = shape.y + shape.h;
-
-      return [
-        { x: x1, y: y1 },
-        { x: x2, y: y1 },
-        { x: x2, y: y2 },
-        { x: x1, y: y2 }
-      ];
-    }
-
-    if (shape.type === "text") {
-      return [{ x: shape.x, y: shape.y }];
-    }
-
-    return shape.points;
-  }
-
-  function getTriangleScalePoint(shape) {
-    const box = getBoundingBox(shape);
-
-    return {
-      x: box.x + box.w + 30 / zoom,
-      y: box.y + box.h + 30 / zoom
-    };
   }
 
   function startPointDrag(event, shape, pointIndex) {
@@ -1101,18 +916,13 @@ export default function EditorCanvas({
     const center = getShapeCenter(shape);
     const rotation = getRotation(shape);
 
-    lockShape?.(shape.id, () => {
-      setSelectedId(shape.id);
+    withShapeLock(shape.id, () => {
+      setSelection([shape.id]);
+      prepareLiveHistoryStep();
 
       if (shape.type === "rect" || shape.type === "ellipse") {
         const points = getEditPoints(shape);
-
-        const oppositePointMap = {
-          0: 2,
-          1: 3,
-          2: 0,
-          3: 1
-        };
+        const oppositePointMap = { 0: 2, 1: 3, 2: 0, 3: 1 };
 
         setDragInfo({
           mode: "move-point",
@@ -1122,17 +932,10 @@ export default function EditorCanvas({
           center,
           rotation
         });
-
         return;
       }
 
-      setDragInfo({
-        mode: "move-point",
-        shapeId: shape.id,
-        pointIndex,
-        center,
-        rotation
-      });
+      setDragInfo({ mode: "move-point", shapeId: shape.id, pointIndex, center, rotation });
     });
   }
 
@@ -1142,17 +945,18 @@ export default function EditorCanvas({
     if (tool !== TOOL.SELECT) return;
     if (isLocked(shape.id)) return;
 
-    const p = getPointerFromSvg(event);
+    const point = getPointerFromSvg(event);
     const center = getShapeCenter(shape);
 
-    lockShape?.(shape.id, () => {
-      setSelectedId(shape.id);
+    withShapeLock(shape.id, () => {
+      setSelection([shape.id]);
+      prepareLiveHistoryStep();
 
       setDragInfo({
         mode: "rotate-shape",
         shapeId: shape.id,
         center,
-        startAngle: getAngle(center, p),
+        startAngle: getAngle(center, point),
         originalRotation: getRotation(shape)
       });
     });
@@ -1163,16 +967,16 @@ export default function EditorCanvas({
 
     if (tool !== TOOL.SELECT) return;
     if (isLocked(shape.id)) return;
-    if (shape.type !== "triangle") return;
 
     const center = getShapeCenter(shape);
     const rotation = getRotation(shape);
-    const p = getPointerFromSvg(event);
-    const localPoint = unrotatePoint(p, center, rotation);
+    const point = getPointerFromSvg(event);
+    const localPoint = unrotatePoint(point, center, rotation);
     const startDistance = Math.max(distance(center, localPoint), 1);
 
-    lockShape?.(shape.id, () => {
-      setSelectedId(shape.id);
+    withShapeLock(shape.id, () => {
+      setSelection([shape.id]);
+      prepareLiveHistoryStep();
 
       setDragInfo({
         mode: "scale-shape",
@@ -1180,10 +984,35 @@ export default function EditorCanvas({
         center,
         rotation,
         startDistance,
-        originalPoints: shape.points.map((pt) => ({ ...pt }))
+        originalShape: structuredClone(shape)
       });
     });
   }
+
+  function startMultiScaleDrag(event, center) {
+    event.stopPropagation();
+
+    if (anyLocked(normalizedSelectedIds)) return;
+
+    const point = getPointerFromSvg(event);
+    const startDistance = Math.max(distance(center, point), 1);
+
+    prepareLiveHistoryStep();
+
+    setDragInfo({
+      mode: "scale-selection",
+      shapeIds: normalizedSelectedIds,
+      center,
+      startDistance,
+      originalShapes: shapes
+        .filter((shape) => normalizedSelectedIds.includes(shape.id))
+        .map((shape) => structuredClone(shape))
+    });
+  }
+
+  const selectionRectBounds = dragInfo?.mode === "select-rect"
+    ? normalizeBounds(dragInfo.start, dragInfo.current)
+    : null;
 
   return (
     <main className="scratch-canvas-panel">
@@ -1200,18 +1029,14 @@ export default function EditorCanvas({
         }}
         onContextMenu={(event) => event.preventDefault()}
       >
-        <rect
-          x="-5000"
-          y="-5000"
-          width="10000"
-          height="10000"
-          fill="white"
-        />
+        <rect x="-5000" y="-5000" width="10000" height="10000" fill="white" />
 
         {shapes.map((shape) => {
-          if (!shape.visible) return null;
+          if (shape.visible === false) return null;
 
           const lock = getLock(shape.id);
+          const focus = getFocus(shape.id);
+          const presence = lock || focus;
 
           return (
             <g
@@ -1221,20 +1046,49 @@ export default function EditorCanvas({
               <ShapeRenderer
                 shape={shape}
                 locked={Boolean(lock)}
-                onPointerDown={(e) => handleShapePointerDown(e, shape)}
+                onPointerDown={(event) => handleShapePointerDown(event, shape)}
               />
 
-              {lock && (
-                <text
-                  x={getBoundingBox(shape).x}
-                  y={getBoundingBox(shape).y - 10}
-                  fill="#ef4444"
-                  fontSize={16 / zoom}
-                  fontWeight="700"
-                  pointerEvents="none"
-                >
-                  {lock.userName}
-                </text>
+              {presence && (
+                <g pointerEvents="none">
+                  <rect
+                    x={getBoundingBox(shape).x}
+                    y={getBoundingBox(shape).y - 28 / zoom}
+                    width={
+                      Math.max(
+                        (presence.userName || "Používateľ").length * 9,
+                        72
+                      ) / zoom
+                    }
+                    height={22 / zoom}
+                    rx={8 / zoom}
+                    fill={presence.userColor || "#3b82f6"}
+                    opacity="0.94"
+                  />
+
+                  <text
+                    x={getBoundingBox(shape).x + 8 / zoom}
+                    y={getBoundingBox(shape).y - 12 / zoom}
+                    fill="white"
+                    fontSize={13 / zoom}
+                    fontWeight="800"
+                  >
+                    {presence.userName || "Používateľ"}
+                  </text>
+
+                  <rect
+                    x={getBoundingBox(shape).x - 5 / zoom}
+                    y={getBoundingBox(shape).y - 5 / zoom}
+                    width={getBoundingBox(shape).w + 10 / zoom}
+                    height={getBoundingBox(shape).h + 10 / zoom}
+                    fill="none"
+                    stroke={presence.userColor || "#3b82f6"}
+                    strokeWidth={lock ? 3 / zoom : 2 / zoom}
+                    strokeDasharray={
+                      lock ? `${8 / zoom} ${5 / zoom}` : `${5 / zoom} ${4 / zoom}`
+                    }
+                  />
+                </g>
               )}
             </g>
           );
@@ -1244,170 +1098,52 @@ export default function EditorCanvas({
         {draft?.type === "ellipse" && <ShapeRenderer shape={draft} preview />}
 
         {draft?.type === "triangle-box" && (
-          <ShapeRenderer
-            shape={createTriangleFromDraft(draft, style)}
-            preview
+          <ShapeRenderer shape={createTriangleFromDraft(draft, style)} preview />
+        )}
+
+        {draft?.type === "quad-box" && (
+          <ShapeRenderer shape={createQuadFromDraft(draft, style)} preview />
+        )}
+
+        {draft?.type === "line" && <ShapeRenderer shape={draft} preview />}
+
+        {selectionRectBounds && (
+          <rect
+            x={selectionRectBounds.x}
+            y={selectionRectBounds.y}
+            width={selectionRectBounds.w}
+            height={selectionRectBounds.h}
+            fill="rgba(133, 92, 214, 0.08)"
+            stroke="#855cd6"
+            strokeDasharray={`${6 / zoom} ${4 / zoom}`}
+            strokeWidth={2 / zoom}
+            pointerEvents="none"
           />
         )}
 
-        {selectedShape && selectedBounds && selectedCenter && tool === TOOL.SELECT && (
-          <g transform={`rotate(${selectedRotation} ${selectedCenter.x} ${selectedCenter.y})`}>
-            <rect
-              x={selectedBounds.x - 6}
-              y={selectedBounds.y - 6}
-              width={selectedBounds.w + 12}
-              height={selectedBounds.h + 12}
-              fill="none"
-              stroke="#855cd6"
-              strokeDasharray="8 6"
-              strokeWidth={2 / zoom}
-            />
+        <EditorCanvasSelectionControls
+          tool={tool}
+          zoom={zoom}
+          selectedShape={selectedShape}
+          selectedBounds={selectedBounds}
+          selectedCenter={selectedCenter}
+          selectedRotation={selectedRotation}
+          selectedIds={normalizedSelectedIds}
+          multiSelectionBounds={multiSelectionBounds}
+          onStartPointDrag={startPointDrag}
+          onStartRotationDrag={startRotationDrag}
+          onStartScaleDrag={startScaleDrag}
+          onStartMultiScaleDrag={startMultiScaleDrag}
+        />
 
-            <line
-              x1={selectedBounds.x + selectedBounds.w / 2}
-              y1={selectedBounds.y - 6}
-              x2={selectedBounds.x + selectedBounds.w / 2}
-              y2={selectedBounds.y - 42 / zoom}
-              stroke="#855cd6"
-              strokeWidth={2 / zoom}
-              strokeDasharray={`${5 / zoom} ${4 / zoom}`}
-            />
-
-            <circle
-              cx={selectedBounds.x + selectedBounds.w / 2}
-              cy={selectedBounds.y - 48 / zoom}
-              r={10 / zoom}
-              fill="#855cd6"
-              stroke="white"
-              strokeWidth={3 / zoom}
-              className="rotate-point"
-              onPointerDown={(event) => startRotationDrag(event, selectedShape)}
-            />
-
-            {selectedShape.type === "triangle" && (
-              <circle
-                cx={getTriangleScalePoint(selectedShape).x}
-                cy={getTriangleScalePoint(selectedShape).y}
-                r={10 / zoom}
-                fill="#f97316"
-                stroke="white"
-                strokeWidth={3 / zoom}
-                className="scale-point"
-                onPointerDown={(event) => startScaleDrag(event, selectedShape)}
-              />
-            )}
-
-            {getEditPoints(selectedShape).map((p, index) => (
-              <circle
-                key={index}
-                cx={p.x}
-                cy={p.y}
-                r={9 / zoom}
-                fill="white"
-                stroke="#855cd6"
-                strokeWidth={3 / zoom}
-                className="point"
-                onPointerDown={(e) => startPointDrag(e, selectedShape, index)}
-              />
-            ))}
-          </g>
-        )}
-
-        {textEditor && (
-          <foreignObject
-            x={textEditor.x}
-            y={textEditor.y - textEditor.fontSize - 90}
-            width={360}
-            height={textEditor.fontSize + 135}
-          >
-            <div
-              xmlns="http://www.w3.org/1999/xhtml"
-              className="svg-text-editor"
-              onMouseDown={(event) => event.stopPropagation()}
-              onPointerDown={(event) => event.stopPropagation()}
-            >
-              <div className="text-editor-row">
-                <input
-                  ref={inputRef}
-                  className="svg-text-input"
-                  value={textEditor.text}
-                  onChange={(event) =>
-                    setTextEditor((prev) => ({
-                      ...prev,
-                      text: event.target.value
-                    }))
-                  }
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") {
-                      event.preventDefault();
-                      commitTextEditor();
-                    }
-
-                    if (event.key === "Escape") {
-                      event.preventDefault();
-                      cancelTextEditor();
-                    }
-                  }}
-                  style={{
-                    fontFamily: textEditor.fontFamily,
-                    fontSize: `${textEditor.fontSize}px`,
-                    color: fill === "none" ? stroke : fill
-                  }}
-                  placeholder="Napíš text..."
-                />
-              </div>
-
-              <div className="text-editor-row">
-                <select
-                  className="svg-text-select"
-                  value={textEditor.fontFamily}
-                  onChange={(event) =>
-                    setTextEditor((prev) => ({
-                      ...prev,
-                      fontFamily: event.target.value
-                    }))
-                  }
-                >
-                  {FONT_OPTIONS.map((font) => (
-                    <option key={font} value={font}>
-                      {font}
-                    </option>
-                  ))}
-                </select>
-
-                <input
-                  className="svg-text-size"
-                  type="number"
-                  min="8"
-                  max="180"
-                  value={textEditor.fontSize}
-                  onChange={(event) =>
-                    setTextEditor((prev) => ({
-                      ...prev,
-                      fontSize: Math.max(8, Number(event.target.value) || 8)
-                    }))
-                  }
-                />
-
-                <button
-                  className="svg-text-confirm"
-                  type="button"
-                  onClick={commitTextEditor}
-                >
-                  OK
-                </button>
-
-                <button
-                  className="svg-text-cancel"
-                  type="button"
-                  onClick={cancelTextEditor}
-                >
-                  ×
-                </button>
-              </div>
-            </div>
-          </foreignObject>
-        )}
+        <EditorCanvasTextEditor
+          textEditor={textEditor}
+          setTextEditor={setTextEditor}
+          fill={fill}
+          stroke={stroke}
+          onConfirm={commitTextEditor}
+          onCancel={cancelTextEditor}
+        />
 
         {tool === TOOL.ERASE && eraserPosition && (
           <circle

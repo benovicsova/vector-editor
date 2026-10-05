@@ -1,29 +1,19 @@
 import { useEffect, useRef, useState } from "react";
 import { io } from "socket.io-client";
-import {
-  Eye,
-  EyeOff,
-  Copy,
-  Trash2,
-  BringToFront,
-  SendToBack,
-  ChevronsUp,
-  ChevronsDown,
-  PanelRightClose,
-  PanelRightOpen
-} from "lucide-react";
 
-import { CANVAS_WIDTH, CANVAS_HEIGHT, TOOL } from "./constants";
+import { COLOR_PALETTE, TOOL } from "./constants";
 import { initialShapes } from "./data/initialShapes";
 
 import Toolbar from "./components/Toolbar";
 import EditorCanvas from "./components/EditorCanvas";
+import ObjectsPanel from "./components/ObjectsPanel";
+import RoomModal from "./components/RoomModal";
+import ProjectNameModal from "./components/ProjectNameModal";
 
-import { downloadTextFile } from "./utils/fileDownload";
-import { duplicateShape, getBoundingBox } from "./utils/geometry";
+import { duplicateShape } from "./utils/geometry";
+import { exportJson, exportPng } from "./utils/exportProject";
 
 const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || "http://localhost:3001";
-const DEFAULT_PROJECT_NAME = "projekt-vektor-editor";
 
 export default function App() {
   const [tool, setTool] = useState(TOOL.RECT);
@@ -34,10 +24,12 @@ export default function App() {
   const shapes = history[historyIndex];
 
   const [selectedId, setSelectedId] = useState(null);
+  const [selectedIds, setSelectedIds] = useState([]);
 
   const [fill, setFill] = useState("#855cd6");
   const [stroke, setStroke] = useState("#1f2937");
   const [strokeWidth, setStrokeWidth] = useState(4);
+  const [recentColors, setRecentColors] = useState(COLOR_PALETTE);
 
   const [fontFamily, setFontFamily] = useState("Arial");
   const [fontSize, setFontSize] = useState(32);
@@ -53,15 +45,22 @@ export default function App() {
   const [roomId, setRoomId] = useState("");
   const [connectionStatus, setConnectionStatus] = useState("offline");
   const [lockedShapes, setLockedShapes] = useState([]);
+  const [focusedShapes, setFocusedShapes] = useState([]);
 
   const [roomModal, setRoomModal] = useState(null);
   const [joinInput, setJoinInput] = useState("");
   const [roomError, setRoomError] = useState("");
+  const [userNameInput, setUserNameInput] = useState("");
+
+  const [projectNameModal, setProjectNameModal] = useState(null);
+  const [projectNameDraft, setProjectNameDraft] = useState("");
 
   const [showObjectsPanel, setShowObjectsPanel] = useState(true);
 
   const socketRef = useRef(null);
   const roomIdRef = useRef("");
+  const focusedShapeIdRef = useRef("");
+  const selectionLockIdsRef = useRef([]);
   const shapesRef = useRef(shapes);
   const dragInfoRef = useRef(dragInfo);
   const historyRef = useRef(history);
@@ -88,8 +87,8 @@ export default function App() {
   useEffect(() => {
     if (!selectedShape) return;
 
-    if (selectedShape.type === "pen") {
-      setFill(selectedShape.stroke || "#1f2937");
+    if (selectedShape.type === "pen" || selectedShape.type === "line") {
+      setFill(selectedShape.fill || "none");
       setStroke(selectedShape.stroke || "#1f2937");
       setStrokeWidth(selectedShape.strokeWidth || 4);
       return;
@@ -107,7 +106,59 @@ export default function App() {
     setFill(selectedShape.fill || "none");
     setStroke(selectedShape.stroke || "#1f2937");
     setStrokeWidth(selectedShape.strokeWidth || 4);
-  }, [selectedId]);
+  }, [selectedShape]);
+
+  useEffect(() => {
+    const socket = socketRef.current;
+    const roomId = roomIdRef.current;
+
+    const nextLockIds = Array.from(
+      new Set([...(selectedIds || []), selectedId].filter(Boolean))
+    );
+
+    if (!socket || !roomId) {
+      selectionLockIdsRef.current = nextLockIds;
+      focusedShapeIdRef.current = nextLockIds[0] || "";
+      return;
+    }
+
+    const previousLockIds = selectionLockIdsRef.current;
+
+    for (const shapeId of previousLockIds) {
+      if (!nextLockIds.includes(shapeId)) {
+        socket.emit("shape-unlock", {
+          roomId,
+          shapeId
+        });
+      }
+    }
+
+    for (const shapeId of nextLockIds) {
+      if (!previousLockIds.includes(shapeId)) {
+        socket.emit(
+          "shape-lock",
+          {
+            roomId,
+            shapeId,
+            userName: getCurrentUserName()
+          },
+          (response) => {
+            if (!response?.success) {
+              setSelectedIds((prev) => prev.filter((id) => id !== shapeId));
+              setSelectedId((prev) => (prev === shapeId ? null : prev));
+              setRoomError(
+                response?.message || "Tento tvar práve drží iný používateľ."
+              );
+              setRoomModal({ type: "error" });
+            }
+          }
+        );
+      }
+    }
+
+    selectionLockIdsRef.current = nextLockIds;
+    focusedShapeIdRef.current = nextLockIds[0] || "";
+  }, [selectedId, selectedIds, roomId, userName]);
 
   useEffect(() => {
     const socket = io(SOCKET_URL);
@@ -121,6 +172,9 @@ export default function App() {
     socket.on("disconnect", () => {
       setConnectionStatus("offline");
       setLockedShapes([]);
+      setFocusedShapes([]);
+      focusedShapeIdRef.current = "";
+      selectionLockIdsRef.current = [];
     });
 
     socket.on("canvas-update", ({ shapes: remoteShapes }) => {
@@ -158,22 +212,54 @@ export default function App() {
       );
     });
 
-    socket.on("shape-locked", ({ shapeId, userName }) => {
-      setLockedShapes((prev) => {
-        if (prev.some((item) => item.shapeId === shapeId)) return prev;
+    socket.on("shape-locked", ({ shapeId, socketId, userName, userColor }) => {
+      if (socketId && socketId === socket.id) return;
 
-        return [
-          ...prev,
-          {
-            shapeId,
-            userName: userName || "Používateľ"
-          }
-        ];
+      setLockedShapes((prev) => {
+        const nextLock = {
+          shapeId,
+          socketId,
+          userName: userName || "Používateľ",
+          userColor: userColor || "#ef4444"
+        };
+
+        if (prev.some((item) => item.shapeId === shapeId)) {
+          return prev.map((item) => (item.shapeId === shapeId ? nextLock : item));
+        }
+
+        return [...prev, nextLock];
       });
     });
 
     socket.on("shape-unlocked", ({ shapeId }) => {
       setLockedShapes((prev) => prev.filter((item) => item.shapeId !== shapeId));
+    });
+
+    socket.on("shape-focused", ({ shapeId, socketId, userName, userColor }) => {
+      if (socketId && socketId === socket.id) return;
+
+      setFocusedShapes((prev) => {
+        const nextFocus = {
+          shapeId,
+          socketId,
+          userName: userName || "Používateľ",
+          userColor: userColor || "#3b82f6"
+        };
+
+        if (prev.some((item) => item.shapeId === shapeId)) {
+          return prev.map((item) =>
+            item.shapeId === shapeId ? nextFocus : item
+          );
+        }
+
+        return [...prev, nextFocus];
+      });
+    });
+
+    socket.on("shape-blurred", ({ shapeId }) => {
+      setFocusedShapes((prev) =>
+        prev.filter((item) => item.shapeId !== shapeId)
+      );
     });
 
     return () => {
@@ -253,12 +339,66 @@ export default function App() {
     return userName.trim() || "Používateľ";
   }
 
+  function rememberColor(color) {
+    if (!color || color === "none") return;
+
+    setRecentColors((prev) => {
+      const next = [color, ...prev.filter((item) => item !== color)];
+      return next.slice(0, 5);
+    });
+  }
+
+  function clearSelection() {
+    setSelectedId(null);
+    setSelectedIds([]);
+  }
+
+  function normalizeSelection(ids) {
+    const uniqueIds = Array.from(new Set(ids.filter(Boolean)));
+
+    setSelectedIds(uniqueIds);
+    setSelectedId(uniqueIds[0] || null);
+  }
+
   function isShapeLocked(shapeId) {
     return lockedShapes.some((item) => item.shapeId === shapeId);
   }
 
   function getShapeLock(shapeId) {
     return lockedShapes.find((item) => item.shapeId === shapeId) ?? null;
+  }
+
+  function isOwnPresence(item) {
+    return Boolean(item?.socketId && socketRef.current?.id === item.socketId);
+  }
+
+  function filterOwnPresence(items = []) {
+    return items.filter((item) => !isOwnPresence(item));
+  }
+
+  function setLocalShapeLock(lock) {
+    if (!lock?.shapeId) return;
+
+    setLockedShapes((prev) => {
+      const nextLock = {
+        shapeId: lock.shapeId,
+        socketId: lock.socketId,
+        userName: lock.userName || getCurrentUserName(),
+        userColor: lock.userColor || "#855cd6"
+      };
+
+      if (prev.some((item) => item.shapeId === lock.shapeId)) {
+        return prev.map((item) =>
+          item.shapeId === lock.shapeId ? nextLock : item
+        );
+      }
+
+      return [...prev, nextLock];
+    });
+  }
+
+  function removeLocalShapeLock(shapeId) {
+    setLockedShapes((prev) => prev.filter((item) => item.shapeId !== shapeId));
   }
 
   function syncShapes(nextShapes) {
@@ -273,11 +413,23 @@ export default function App() {
 
   function commitShapes(nextShapes, shouldSync = true) {
     setHistory((prev) => {
-      const sliced = prev.slice(0, historyIndexRef.current + 1);
-      return [...sliced, nextShapes];
+      const currentIndex = historyIndexRef.current;
+      const sliced = prev.slice(0, currentIndex + 1);
+      const nextHistory = [...sliced, nextShapes];
+
+      historyRef.current = nextHistory;
+      historyIndexRef.current = nextHistory.length - 1;
+
+      return nextHistory;
     });
 
-    setHistoryIndex((prev) => prev + 1);
+    setHistoryIndex((prev) => {
+      const nextIndex = prev + 1;
+      historyIndexRef.current = nextIndex;
+      return nextIndex;
+    });
+
+    shapesRef.current = nextShapes;
 
     if (shouldSync) {
       syncShapes(nextShapes);
@@ -297,11 +449,14 @@ export default function App() {
     const nextShapes =
       typeof updater === "function" ? updater(currentShapes) : updater;
 
-    setHistory((prev) =>
-      prev.map((item, index) =>
+    setHistory((prev) => {
+      const nextHistory = prev.map((item, index) =>
         index === historyIndexRef.current ? nextShapes : item
-      )
-    );
+      );
+
+      historyRef.current = nextHistory;
+      return nextHistory;
+    });
 
     shapesRef.current = nextShapes;
     syncShapes(nextShapes);
@@ -311,7 +466,7 @@ export default function App() {
     setTool(nextTool);
 
     if (nextTool !== TOOL.SELECT) {
-      setSelectedId(null);
+      clearSelection();
     }
   }
 
@@ -347,13 +502,16 @@ export default function App() {
           return;
         }
 
-        onSuccess?.();
+        onSuccess?.(response);
       }
     );
   }
 
   function unlockShape(shapeId) {
     if (!shapeId) return;
+
+    removeLocalShapeLock(shapeId);
+
     if (!roomIdRef.current || !socketRef.current) return;
 
     socketRef.current.emit("shape-unlock", {
@@ -363,39 +521,37 @@ export default function App() {
   }
 
   function updateSelectedShapeStyle(property, value) {
-    if (!selectedId) return;
-    if (isShapeLocked(selectedId)) return;
+    const idsToUpdate = selectedIds.length > 0 ? selectedIds : selectedId ? [selectedId] : [];
 
-    lockShape(selectedId, () => {
-      setShapesDirect((prev) =>
-        prev.map((shape) => {
-          if (shape.id !== selectedId) return shape;
+    if (idsToUpdate.length === 0) return;
+    if (idsToUpdate.some((id) => isShapeLocked(id))) return;
 
-          if (shape.type === "pen" && property === "fill") {
-            if (value === "none") return shape;
+    setShapesDirect((prev) =>
+      prev.map((shape) => {
+        if (!idsToUpdate.includes(shape.id)) return shape;
 
-            return {
-              ...shape,
-              stroke: value
-            };
-          }
-
-          if (shape.type === "text" && property === "stroke") {
-            return {
-              ...shape,
-              stroke: value
-            };
-          }
+        if ((shape.type === "pen" || shape.type === "line") && property === "fill") {
+          if (value === "none") return { ...shape, fill: "none" };
 
           return {
             ...shape,
-            [property]: value
+            fill: value
           };
-        })
-      );
+        }
 
-      unlockShape(selectedId);
-    });
+        if (shape.type === "text" && property === "stroke") {
+          return {
+            ...shape,
+            stroke: value
+          };
+        }
+
+        return {
+          ...shape,
+          [property]: value
+        };
+      })
+    );
   }
 
   function updateSelectedTextTypography(property, value) {
@@ -420,11 +576,13 @@ export default function App() {
 
   function handleFillChange(nextFill) {
     setFill(nextFill);
+    rememberColor(nextFill);
     updateSelectedShapeStyle("fill", nextFill);
   }
 
   function handleStrokeChange(nextStroke) {
     setStroke(nextStroke);
+    rememberColor(nextStroke);
     updateSelectedShapeStyle("stroke", nextStroke);
   }
 
@@ -447,28 +605,21 @@ export default function App() {
     updateSelectedTextTypography("fontSize", normalizedFontSize);
   }
 
-  function askForUserNameIfNeeded() {
-    const current = userName.trim();
-
-    if (current) return current;
-
-    const entered = window.prompt("Zadaj svoje meno:", "Používateľ");
-
-    if (!entered) return "";
-
-    const normalized = entered.trim();
-
-    if (!normalized) return "";
-
-    setUserName(normalized);
-    return normalized;
-  }
-
   function createRoom() {
     setRoomError("");
+    setUserNameInput(userName || "");
+    setRoomModal({ type: "create" });
+  }
 
-    const normalizedUserName = askForUserNameIfNeeded();
-    if (!normalizedUserName) return;
+  function confirmCreateRoom() {
+    const normalizedUserName = userNameInput.trim();
+
+    if (!normalizedUserName) {
+      setRoomError("Zadaj svoje meno.");
+      return;
+    }
+
+    setUserName(normalizedUserName);
 
     if (!socketRef.current) {
       setRoomError("Server nie je dostupný.");
@@ -491,7 +642,8 @@ export default function App() {
 
         setRoomId(response.roomId);
         roomIdRef.current = response.roomId;
-        setLockedShapes(response.lockedShapes ?? []);
+        setLockedShapes(filterOwnPresence(response.lockedShapes ?? []));
+        setFocusedShapes(filterOwnPresence(response.focusedShapes ?? []));
 
         setRoomModal({
           type: "created",
@@ -502,21 +654,22 @@ export default function App() {
   }
 
   function openJoinRoomModal() {
-    const normalizedUserName = askForUserNameIfNeeded();
-    if (!normalizedUserName) return;
-
     setJoinInput("");
+    setUserNameInput(userName || "");
     setRoomError("");
     setRoomModal({ type: "join" });
   }
 
   function joinRoom() {
     const normalizedRoomId = joinInput.trim();
-    const normalizedUserName = askForUserNameIfNeeded();
-
-    if (!normalizedUserName) return;
+    const normalizedUserName = userNameInput.trim();
 
     setRoomError("");
+
+    if (!normalizedUserName) {
+      setRoomError("Zadaj svoje meno.");
+      return;
+    }
 
     if (!/^\d{4}$/.test(normalizedRoomId)) {
       setRoomError("ID miestnosti musí byť 4-ciferné číslo.");
@@ -527,6 +680,8 @@ export default function App() {
       setRoomError("Server nie je dostupný.");
       return;
     }
+
+    setUserName(normalizedUserName);
 
     socketRef.current.emit(
       "join-room",
@@ -540,20 +695,18 @@ export default function App() {
           return;
         }
 
-        const confirmJoin = window.confirm(
-          `Naozaj sa chceš pripojiť do miestnosti ${response.roomId}?`
-        );
-
-        if (!confirmJoin) return;
-
         setRoomId(response.roomId);
         roomIdRef.current = response.roomId;
-        setLockedShapes(response.lockedShapes ?? []);
+        setLockedShapes(filterOwnPresence(response.lockedShapes ?? []));
+        setFocusedShapes(filterOwnPresence(response.focusedShapes ?? []));
 
         if (Array.isArray(response.shapes)) {
           setHistory([response.shapes]);
           setHistoryIndex(0);
-          setSelectedId(null);
+          historyRef.current = [response.shapes];
+          historyIndexRef.current = 0;
+          shapesRef.current = response.shapes;
+          clearSelection();
           setDraft(null);
           setDragInfo(null);
         }
@@ -580,8 +733,11 @@ export default function App() {
     const nextIndex = currentIndex - 1;
     const nextShapes = currentHistory[nextIndex];
 
+    historyIndexRef.current = nextIndex;
+    shapesRef.current = nextShapes;
+
     setHistoryIndex(nextIndex);
-    setSelectedId(null);
+    clearSelection();
     syncShapes(nextShapes);
   }
 
@@ -594,8 +750,11 @@ export default function App() {
     const nextIndex = currentIndex + 1;
     const nextShapes = currentHistory[nextIndex];
 
+    historyIndexRef.current = nextIndex;
+    shapesRef.current = nextShapes;
+
     setHistoryIndex(nextIndex);
-    setSelectedId(null);
+    clearSelection();
     syncShapes(nextShapes);
   }
 
@@ -632,7 +791,7 @@ export default function App() {
       const nextShapes = [...shapesRef.current, copy];
 
       setShapesDirect(nextShapes);
-      setSelectedId(copy.id);
+      normalizeSelection([copy.id]);
       setTool(TOOL.SELECT);
       unlockShape(shapeId);
     });
@@ -647,12 +806,45 @@ export default function App() {
     clipboardRef.current = structuredClone(copy);
 
     setShapesDirect(nextShapes);
-    setSelectedId(copy.id);
+    normalizeSelection([copy.id]);
   }
 
   function deleteSelected() {
-    if (!selectedId) return;
-    deleteShapeById(selectedId);
+    const idsToDelete = selectedIds.length > 0 ? selectedIds : selectedId ? [selectedId] : [];
+
+    if (idsToDelete.length === 0) return;
+
+    const currentShapes = shapesRef.current;
+    const orderedIds = currentShapes
+      .filter((shape) => idsToDelete.includes(shape.id) && !isShapeLocked(shape.id))
+      .map((shape) => shape.id)
+      .reverse();
+
+    if (orderedIds.length === 0) return;
+
+    const nextHistoryItems = [];
+    let workingShapes = currentShapes;
+
+    for (const shapeId of orderedIds) {
+      workingShapes = workingShapes.filter((shape) => shape.id !== shapeId);
+      nextHistoryItems.push(workingShapes);
+    }
+
+    const currentIndex = historyIndexRef.current;
+    const nextHistory = [
+      ...historyRef.current.slice(0, currentIndex + 1),
+      ...nextHistoryItems
+    ];
+    const nextIndex = nextHistory.length - 1;
+
+    historyRef.current = nextHistory;
+    historyIndexRef.current = nextIndex;
+    shapesRef.current = workingShapes;
+
+    setHistory(nextHistory);
+    setHistoryIndex(nextIndex);
+    syncShapes(workingShapes);
+    clearSelection();
   }
 
   function deleteShapeById(shapeId) {
@@ -663,8 +855,9 @@ export default function App() {
       setShapesDirect((prev) => prev.filter((shape) => shape.id !== shapeId));
       unlockShape(shapeId);
 
-      if (selectedId === shapeId) {
-        setSelectedId(null);
+      if (selectedId === shapeId || selectedIds.includes(shapeId)) {
+        setSelectedIds((prev) => prev.filter((id) => id !== shapeId));
+        if (selectedId === shapeId) setSelectedId(null);
       }
     });
   }
@@ -803,7 +996,12 @@ export default function App() {
       );
     }
 
-    setSelectedId(shapeId);
+    normalizeSelection([shapeId]);
+    setTool(TOOL.SELECT);
+  }
+
+  function focusPanelInput(shapeId) {
+    normalizeSelection([shapeId]);
     setTool(TOOL.SELECT);
   }
 
@@ -813,202 +1011,57 @@ export default function App() {
     if (shape.type === "rect") return `Obdĺžnik ${number}`;
     if (shape.type === "ellipse") return `Elipsa ${number}`;
     if (shape.type === "triangle") return `Trojuholník ${number}`;
-    if (shape.type === "pen") return `Čiara ${number}`;
+    if (shape.type === "quad") return `Štvoruholník ${number}`;
+    if (shape.type === "line") return `Čiara ${number}`;
+    if (shape.type === "pen") return `Kresba ${number}`;
     if (shape.type === "text") return `Text ${number}`;
 
     return `Objekt ${number}`;
   }
 
-  function pointsToPath(points) {
-    if (!points || points.length === 0) return "";
-    if (points.length === 1) return `M ${points[0].x} ${points[0].y}`;
-
-    let path = `M ${points[0].x} ${points[0].y}`;
-
-    for (let i = 1; i < points.length - 1; i++) {
-      const current = points[i];
-      const next = points[i + 1];
-
-      const midX = (current.x + next.x) / 2;
-      const midY = (current.y + next.y) / 2;
-
-      path += ` Q ${current.x} ${current.y} ${midX} ${midY}`;
-    }
-
-    const last = points[points.length - 1];
-    path += ` L ${last.x} ${last.y}`;
-
-    return path;
-  }
-
-  function escapeXml(value) {
-    return String(value)
-      .replaceAll("&", "&amp;")
-      .replaceAll('"', "&quot;")
-      .replaceAll("<", "&lt;")
-      .replaceAll(">", "&gt;");
-  }
-
-  function getExportBounds(visibleShapes) {
-    if (visibleShapes.length === 0) {
-      return {
-        x: 0,
-        y: 0,
-        width: CANVAS_WIDTH,
-        height: CANVAS_HEIGHT
-      };
-    }
-
-    const boxes = visibleShapes.map((shape) => getBoundingBox(shape));
-
-    const minX = Math.min(...boxes.map((box) => box.x));
-    const minY = Math.min(...boxes.map((box) => box.y));
-    const maxX = Math.max(...boxes.map((box) => box.x + box.w));
-    const maxY = Math.max(...boxes.map((box) => box.y + box.h));
-
-    const padding = 60;
-
-    return {
-      x: minX - padding,
-      y: minY - padding,
-      width: Math.max(maxX - minX + padding * 2, 1),
-      height: Math.max(maxY - minY + padding * 2, 1)
-    };
-  }
-
-  function shapeToSvg(shape) {
-    const fillValue = shape.fill || "none";
-    const strokeValue = shape.stroke || "#1f2937";
-    const strokeWidthValue = Math.max(Number(shape.strokeWidth) || 1, 1);
-
-    if (shape.type === "rect") {
-      const x = Math.min(shape.x, shape.x + shape.w);
-      const y = Math.min(shape.y, shape.y + shape.h);
-      const w = Math.abs(shape.w);
-      const h = Math.abs(shape.h);
-
-      return `<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="${escapeXml(fillValue)}" stroke="${escapeXml(strokeValue)}" stroke-width="${strokeWidthValue}" />`;
-    }
-
-    if (shape.type === "ellipse") {
-      return `<ellipse cx="${shape.x + shape.w / 2}" cy="${shape.y + shape.h / 2}" rx="${Math.abs(shape.w / 2)}" ry="${Math.abs(shape.h / 2)}" fill="${escapeXml(fillValue)}" stroke="${escapeXml(strokeValue)}" stroke-width="${strokeWidthValue}" />`;
-    }
-
-    if (shape.type === "triangle") {
-      const points = shape.points.map((p) => `${p.x},${p.y}`).join(" ");
-
-      return `<polygon points="${points}" fill="${escapeXml(fillValue)}" stroke="${escapeXml(strokeValue)}" stroke-width="${strokeWidthValue}" stroke-linejoin="round" stroke-linecap="round" />`;
-    }
-
-    if (shape.type === "pen") {
-      return `<path d="${pointsToPath(shape.points)}" fill="none" stroke="${escapeXml(strokeValue)}" stroke-width="${strokeWidthValue}" stroke-linejoin="round" stroke-linecap="round" />`;
-    }
-
-    if (shape.type === "text") {
-      const textFill = shape.fill && shape.fill !== "none" ? shape.fill : strokeValue;
-
-      return `<text x="${shape.x}" y="${shape.y}" fill="${escapeXml(textFill)}" font-size="${shape.fontSize || 32}" font-family="${escapeXml(shape.fontFamily || "Arial")}" font-weight="700">${escapeXml(shape.text || "")}</text>`;
-    }
-
-    return "";
-  }
-
-  function createExportSvg() {
-    const visibleShapes = shapes.filter((shape) => shape.visible !== false);
-    const bounds = getExportBounds(visibleShapes);
-
-    const svgShapes = visibleShapes.map((shape) => shapeToSvg(shape)).join("\n");
-
-    return {
-      svgText: `<svg xmlns="http://www.w3.org/2000/svg" width="${bounds.width}" height="${bounds.height}" viewBox="${bounds.x} ${bounds.y} ${bounds.width} ${bounds.height}">
-  <rect x="${bounds.x}" y="${bounds.y}" width="${bounds.width}" height="${bounds.height}" fill="white" />
-  ${svgShapes}
-</svg>`,
-      width: Math.ceil(bounds.width),
-      height: Math.ceil(bounds.height)
-    };
-  }
-
-  function getSafeFileName(name) {
-    const normalized = String(name || "")
-      .trim()
-      .replace(/[<>:"/\\|?*]+/g, "-")
-      .replace(/\s+/g, "-");
-
-    return normalized || DEFAULT_PROJECT_NAME;
-  }
-
   function handleExportPng() {
-    const { svgText, width, height } = createExportSvg();
+    const normalizedName = projectName.trim();
 
-    const svgBlob = new Blob([svgText], {
-      type: "image/svg+xml;charset=utf-8"
+    if (!normalizedName) {
+      setProjectNameDraft("");
+      setProjectNameModal({ action: "png" });
+      return;
+    }
+
+    exportPng({
+      shapes,
+      projectName: normalizedName
     });
-
-    const url = URL.createObjectURL(svgBlob);
-    const image = new Image();
-
-    image.onload = () => {
-      const canvas = document.createElement("canvas");
-
-      canvas.width = width;
-      canvas.height = height;
-
-      const context = canvas.getContext("2d");
-
-      context.fillStyle = "white";
-      context.fillRect(0, 0, canvas.width, canvas.height);
-      context.drawImage(image, 0, 0);
-
-      URL.revokeObjectURL(url);
-
-      canvas.toBlob((blob) => {
-        if (!blob) return;
-
-        const safeName = getSafeFileName(projectName || DEFAULT_PROJECT_NAME);
-        const downloadUrl = URL.createObjectURL(blob);
-        const link = document.createElement("a");
-
-        link.href = downloadUrl;
-        link.download = `${safeName}.png`;
-        link.click();
-
-        URL.revokeObjectURL(downloadUrl);
-      }, "image/png");
-    };
-
-    image.src = url;
   }
 
   function handleExportJson() {
-    let name = projectName.trim();
+    const normalizedName = projectName.trim();
 
-    if (!name) {
-      const enteredName = window.prompt("Zadaj názov projektu:", DEFAULT_PROJECT_NAME);
-
-      if (!enteredName) return;
-
-      name = enteredName.trim();
-
-      if (!name) return;
-
-      setProjectName(name);
+    if (!normalizedName) {
+      setProjectNameDraft("");
+      setProjectNameModal({ action: "json" });
+      return;
     }
 
-    const safeName = getSafeFileName(name);
+    exportJson({ shapes, projectName: normalizedName, setProjectName });
+  }
 
-    downloadTextFile(
-      `${safeName}.json`,
-      JSON.stringify(
-        {
-          name,
-          shapes
-        },
-        null,
-        2
-      ),
-      "application/json"
-    );
+  function confirmProjectNameModal() {
+    const normalizedName = projectNameDraft.trim() || "projekt";
+
+    setProjectName(normalizedName);
+    setProjectNameModal(null);
+
+    if (projectNameModal?.action === "png") {
+      exportPng({
+        shapes,
+        projectName: normalizedName
+      });
+    }
+
+    if (projectNameModal?.action === "json") {
+      exportJson({ shapes, projectName: normalizedName, setProjectName });
+    }
   }
 
   function handleImportJson(event) {
@@ -1023,15 +1076,24 @@ export default function App() {
 
         if (Array.isArray(data)) {
           commitShapes(data);
-          setSelectedId(null);
+          clearSelection();
+          setDraft(null);
+          setDragInfo(null);
+          setShowObjectsPanel(true);
           return;
         }
 
         if (Array.isArray(data.shapes)) {
           commitShapes(data.shapes);
           setProjectName(data.name || "");
-          setSelectedId(null);
+          clearSelection();
+          setDraft(null);
+          setDragInfo(null);
+          setShowObjectsPanel(true);
+          return;
         }
+
+        alert("Tento JSON súbor nemá správny formát projektu.");
       } catch {
         alert("Import JSON súboru zlyhal.");
       }
@@ -1050,6 +1112,7 @@ export default function App() {
         setFill={handleFillChange}
         stroke={stroke}
         setStroke={handleStrokeChange}
+        recentColors={recentColors}
         strokeWidth={strokeWidth}
         setStrokeWidth={handleStrokeWidthChange}
         fontFamily={fontFamily}
@@ -1058,8 +1121,6 @@ export default function App() {
         setFontSize={handleFontSizeChange}
         projectName={projectName}
         setProjectName={setProjectName}
-        userName={userName}
-        setUserName={setUserName}
         onExportPng={handleExportPng}
         onExportJson={handleExportJson}
         onImportJson={handleImportJson}
@@ -1087,142 +1148,21 @@ export default function App() {
         onToggleObjectsPanel={() => setShowObjectsPanel((prev) => !prev)}
       />
 
-      <button
-        className={
-          showObjectsPanel
-            ? "objects-side-toggle open"
-            : "objects-side-toggle closed"
-        }
-        type="button"
-        onClick={() => setShowObjectsPanel((prev) => !prev)}
-        title={showObjectsPanel ? "Skryť panel objektov" : "Zobraziť panel objektov"}
-      >
-        {showObjectsPanel ? <PanelRightClose /> : <PanelRightOpen />}
-      </button>
-
-      <aside
-        className={
-          showObjectsPanel ? "objects-panel open" : "objects-panel collapsed"
-        }
-      >
-        <div className="objects-panel-header">
-          <strong>Objekty a vrstvy</strong>
-
-          <button
-            className="objects-panel-close"
-            type="button"
-            onClick={() => setShowObjectsPanel(false)}
-            title="Skryť panel"
-          >
-            ×
-          </button>
-        </div>
-
-        {panelShapes.length === 0 && (
-          <div className="objects-empty">Zatiaľ tu nie sú žiadne objekty.</div>
-        )}
-
-        <div className="objects-list">
-          {panelShapes
-            .map((shape, index) => ({ shape, index }))
-            .reverse()
-            .map(({ shape, index }) => (
-              <div
-                key={shape.id}
-                className={
-                  selectedId === shape.id
-                    ? "objects-item selected"
-                    : "objects-item"
-                }
-              >
-                <button
-                  className="objects-thumbnail-button"
-                  type="button"
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    selectShapeFromPanel(shape.id);
-                  }}
-                  title="Vybrať objekt"
-                >
-                  <ShapeThumbnail shape={shape} />
-                </button>
-
-                <input
-                  className="objects-rename-input"
-                  value={shape.name ?? getShapeDefaultLabel(shape, index)}
-                  onChange={(event) =>
-                    renameShapeFromPanel(shape.id, event.target.value)
-                  }
-                  onFocus={(event) => {
-                    event.stopPropagation();
-                    setSelectedId(shape.id);
-                    setTool(TOOL.SELECT);
-                  }}
-                  title="Premenovať objekt"
-                />
-
-                <div
-                  className="objects-actions-row"
-                  onMouseDown={(event) => event.stopPropagation()}
-                  onClick={(event) => event.stopPropagation()}
-                >
-                  <MiniButton
-                    title="Skryť / zobraziť"
-                    active={shape.visible !== false}
-                    onClick={() => toggleShapeVisibleFromPanel(shape.id)}
-                  >
-                    {shape.visible === false ? <EyeOff /> : <Eye />}
-                  </MiniButton>
-
-                  <MiniButton
-                    title="Duplikovať"
-                    onClick={() => duplicateShapeById(shape.id)}
-                  >
-                    <Copy />
-                  </MiniButton>
-
-                  <MiniButton
-                    title="Vymazať"
-                    danger
-                    onClick={() => deleteShapeById(shape.id)}
-                  >
-                    <Trash2 />
-                  </MiniButton>
-
-                  <MiniDivider />
-
-                  <MiniButton
-                    title="O 1 dopredu"
-                    onClick={() => moveLayerById(shape.id, "up")}
-                  >
-                    <BringToFront />
-                  </MiniButton>
-
-                  <MiniButton
-                    title="O 1 dozadu"
-                    onClick={() => moveLayerById(shape.id, "down")}
-                  >
-                    <SendToBack />
-                  </MiniButton>
-
-                  <MiniButton
-                    title="Úplne dopredu"
-                    onClick={() => moveLayerToExtremeById(shape.id, "front")}
-                  >
-                    <ChevronsUp />
-                  </MiniButton>
-
-                  <MiniButton
-                    title="Úplne dozadu"
-                    onClick={() => moveLayerToExtremeById(shape.id, "back")}
-                  >
-                    <ChevronsDown />
-                  </MiniButton>
-                </div>
-              </div>
-            ))}
-        </div>
-      </aside>
+      <ObjectsPanel
+        showObjectsPanel={showObjectsPanel}
+        setShowObjectsPanel={setShowObjectsPanel}
+        panelShapes={panelShapes}
+        selectedId={selectedId}
+        getShapeDefaultLabel={getShapeDefaultLabel}
+        onSelectShape={selectShapeFromPanel}
+        onRenameShape={renameShapeFromPanel}
+        onToggleVisible={toggleShapeVisibleFromPanel}
+        onDuplicateShape={duplicateShapeById}
+        onDeleteShape={deleteShapeById}
+        onMoveLayer={moveLayerById}
+        onMoveLayerToExtreme={moveLayerToExtremeById}
+        onFocusInput={focusPanelInput}
+      />
 
       <EditorCanvas
         tool={tool}
@@ -1232,6 +1172,8 @@ export default function App() {
         setShapesLive={setShapesLive}
         selectedId={selectedId}
         setSelectedId={setSelectedId}
+        selectedIds={selectedIds}
+        setSelectedIds={setSelectedIds}
         fill={fill}
         stroke={stroke}
         strokeWidth={strokeWidth}
@@ -1244,361 +1186,32 @@ export default function App() {
         zoom={zoom}
         setZoom={setZoom}
         lockedShapes={lockedShapes}
+        focusedShapes={focusedShapes}
         lockShape={lockShape}
         unlockShape={unlockShape}
       />
 
-      {roomModal && (
-        <div style={modalStyles.backdrop} onMouseDown={closeRoomModal}>
-          <div style={modalStyles.card} onMouseDown={(event) => event.stopPropagation()}>
-            {roomModal.type === "created" && (
-              <>
-                <div style={modalStyles.icon}>👥</div>
-                <h2 style={modalStyles.title}>Miestnosť vytvorená</h2>
-                <p style={modalStyles.text}>
-                  Zdieľaj toto 4-ciferné číslo s ďalším používateľom.
-                </p>
+      <RoomModal
+        roomModal={roomModal}
+        joinInput={joinInput}
+        setJoinInput={setJoinInput}
+        userNameInput={userNameInput}
+        setUserNameInput={setUserNameInput}
+        roomError={roomError}
+        setRoomError={setRoomError}
+        onCreateConfirm={confirmCreateRoom}
+        onJoinConfirm={joinRoom}
+        onClose={closeRoomModal}
+      />
 
-                <div style={modalStyles.roomCode}>{roomModal.roomId}</div>
-
-                <button style={modalStyles.primaryButton} onClick={closeRoomModal}>
-                  Hotovo
-                </button>
-              </>
-            )}
-
-            {roomModal.type === "join" && (
-              <>
-                <div style={modalStyles.icon}>↪</div>
-                <h2 style={modalStyles.title}>Pripojiť sa k miestnosti</h2>
-                <p style={modalStyles.text}>Zadaj 4-ciferné ID miestnosti.</p>
-
-                <input
-                  style={modalStyles.input}
-                  value={joinInput}
-                  onChange={(event) => {
-                    const value = event.target.value.replace(/\D/g, "").slice(0, 4);
-                    setJoinInput(value);
-                    setRoomError("");
-                  }}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") {
-                      joinRoom();
-                    }
-                  }}
-                  autoFocus
-                  placeholder="1234"
-                  inputMode="numeric"
-                  maxLength={4}
-                />
-
-                {roomError && <div style={modalStyles.error}>{roomError}</div>}
-
-                <div style={modalStyles.actions}>
-                  <button style={modalStyles.secondaryButton} onClick={closeRoomModal}>
-                    Zrušiť
-                  </button>
-
-                  <button style={modalStyles.primaryButton} onClick={joinRoom}>
-                    Pripojiť
-                  </button>
-                </div>
-              </>
-            )}
-
-            {roomModal.type === "joined" && (
-              <>
-                <div style={modalStyles.icon}>✓</div>
-                <h2 style={modalStyles.title}>Pripojené</h2>
-                <p style={modalStyles.text}>Si pripojená k miestnosti:</p>
-
-                <div style={modalStyles.roomCode}>{roomModal.roomId}</div>
-
-                <button style={modalStyles.primaryButton} onClick={closeRoomModal}>
-                  Pokračovať
-                </button>
-              </>
-            )}
-
-            {roomModal.type === "error" && (
-              <>
-                <div style={modalStyles.icon}>!</div>
-                <h2 style={modalStyles.title}>Chyba</h2>
-                <p style={modalStyles.text}>{roomError || "Nastala chyba."}</p>
-
-                <button style={modalStyles.primaryButton} onClick={closeRoomModal}>
-                  Zavrieť
-                </button>
-              </>
-            )}
-          </div>
-        </div>
+      {projectNameModal && (
+        <ProjectNameModal
+          value={projectNameDraft}
+          setValue={setProjectNameDraft}
+          onConfirm={confirmProjectNameModal}
+          onCancel={() => setProjectNameModal(null)}
+        />
       )}
     </div>
   );
 }
-
-function MiniButton({ title, onClick, children, active, danger }) {
-  return (
-    <button
-      className={[
-        "objects-mini-button",
-        active ? "active" : "",
-        danger ? "danger" : ""
-      ].join(" ")}
-      type="button"
-      title={title}
-      onMouseDown={(event) => {
-        event.preventDefault();
-        event.stopPropagation();
-      }}
-      onClick={(event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        onClick?.();
-      }}
-    >
-      {children}
-    </button>
-  );
-}
-
-function MiniDivider() {
-  return <span className="objects-mini-divider" />;
-}
-
-function ShapeThumbnail({ shape }) {
-  const box = getBoundingBox(shape);
-
-  const padding = Math.max(Number(shape.strokeWidth) || 2, 2) + 10;
-  const viewX = box.x - padding;
-  const viewY = box.y - padding;
-  const viewW = Math.max(box.w + padding * 2, 1);
-  const viewH = Math.max(box.h + padding * 2, 1);
-
-  const stroke = shape.stroke || "#1f2937";
-  const fill = shape.fill || "none";
-  const strokeWidth = Math.max(Number(shape.strokeWidth) || 1, 1);
-  const rotation = Number(shape.rotation) || 0;
-  const center = {
-    x: box.x + box.w / 2,
-    y: box.y + box.h / 2
-  };
-
-  return (
-    <svg
-      className="objects-thumbnail"
-      viewBox={`${viewX} ${viewY} ${viewW} ${viewH}`}
-      preserveAspectRatio="xMidYMid meet"
-    >
-      <rect
-        x={viewX}
-        y={viewY}
-        width={viewW}
-        height={viewH}
-        fill="white"
-      />
-
-      <g transform={`rotate(${rotation} ${center.x} ${center.y})`}>
-        {shape.type === "rect" && (
-          <rect
-            x={Math.min(shape.x, shape.x + shape.w)}
-            y={Math.min(shape.y, shape.y + shape.h)}
-            width={Math.abs(shape.w)}
-            height={Math.abs(shape.h)}
-            fill={fill}
-            stroke={stroke}
-            strokeWidth={strokeWidth}
-          />
-        )}
-
-        {shape.type === "ellipse" && (
-          <ellipse
-            cx={shape.x + shape.w / 2}
-            cy={shape.y + shape.h / 2}
-            rx={Math.abs(shape.w / 2)}
-            ry={Math.abs(shape.h / 2)}
-            fill={fill}
-            stroke={stroke}
-            strokeWidth={strokeWidth}
-          />
-        )}
-
-        {shape.type === "triangle" && (
-          <polygon
-            points={shape.points.map((point) => `${point.x},${point.y}`).join(" ")}
-            fill={fill}
-            stroke={stroke}
-            strokeWidth={strokeWidth}
-            strokeLinejoin="round"
-            strokeLinecap="round"
-          />
-        )}
-
-        {shape.type === "pen" && (
-          <path
-            d={pointsToThumbnailPath(shape.points)}
-            fill="none"
-            stroke={stroke}
-            strokeWidth={strokeWidth}
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          />
-        )}
-
-        {shape.type === "text" && (
-          <text
-            x={shape.x}
-            y={shape.y}
-            fill={shape.fill && shape.fill !== "none" ? shape.fill : stroke}
-            fontSize={shape.fontSize || 32}
-            fontFamily={shape.fontFamily || "Arial"}
-            fontWeight="700"
-          >
-            {shape.text || "Text"}
-          </text>
-        )}
-      </g>
-
-      {shape.visible === false && (
-        <rect
-          x={viewX}
-          y={viewY}
-          width={viewW}
-          height={viewH}
-          fill="rgba(255,255,255,0.68)"
-        />
-      )}
-    </svg>
-  );
-}
-
-function pointsToThumbnailPath(points) {
-  if (!points || points.length === 0) return "";
-  if (points.length === 1) return `M ${points[0].x} ${points[0].y}`;
-
-  let path = `M ${points[0].x} ${points[0].y}`;
-
-  for (let i = 1; i < points.length - 1; i++) {
-    const current = points[i];
-    const next = points[i + 1];
-
-    const midX = (current.x + next.x) / 2;
-    const midY = (current.y + next.y) / 2;
-
-    path += ` Q ${current.x} ${current.y} ${midX} ${midY}`;
-  }
-
-  const last = points[points.length - 1];
-  path += ` L ${last.x} ${last.y}`;
-
-  return path;
-}
-
-const modalStyles = {
-  backdrop: {
-    position: "fixed",
-    inset: 0,
-    zIndex: 1000,
-    background: "rgba(15, 23, 42, 0.45)",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    padding: 24
-  },
-  card: {
-    width: "min(420px, 100%)",
-    background: "white",
-    borderRadius: 24,
-    padding: 28,
-    boxShadow: "0 24px 80px rgba(15, 23, 42, 0.28)",
-    textAlign: "center"
-  },
-  icon: {
-    width: 52,
-    height: 52,
-    borderRadius: 18,
-    background: "#f3f0ff",
-    color: "#5b35b1",
-    display: "inline-flex",
-    alignItems: "center",
-    justifyContent: "center",
-    fontSize: 26,
-    fontWeight: 800,
-    marginBottom: 14
-  },
-  title: {
-    margin: 0,
-    fontSize: 22,
-    fontWeight: 800,
-    color: "#111827"
-  },
-  text: {
-    margin: "10px 0 18px",
-    color: "#6b7280",
-    fontSize: 14,
-    lineHeight: 1.5
-  },
-  roomCode: {
-    display: "inline-flex",
-    alignItems: "center",
-    justifyContent: "center",
-    minWidth: 150,
-    height: 64,
-    borderRadius: 18,
-    background: "#f9fafb",
-    border: "1px solid #e5e7eb",
-    color: "#5b35b1",
-    fontSize: 34,
-    fontWeight: 900,
-    letterSpacing: "0.16em",
-    marginBottom: 22
-  },
-  input: {
-    width: "100%",
-    height: 54,
-    borderRadius: 16,
-    border: "1px solid #d1d5db",
-    outline: "none",
-    textAlign: "center",
-    fontSize: 28,
-    fontWeight: 800,
-    letterSpacing: "0.16em",
-    color: "#111827",
-    marginBottom: 10
-  },
-  error: {
-    color: "#dc2626",
-    fontSize: 13,
-    fontWeight: 600,
-    marginBottom: 12
-  },
-  actions: {
-    display: "flex",
-    gap: 10,
-    justifyContent: "center",
-    marginTop: 8
-  },
-  primaryButton: {
-    height: 42,
-    border: "none",
-    borderRadius: 14,
-    padding: "0 18px",
-    background: "#855cd6",
-    color: "white",
-    fontSize: 14,
-    fontWeight: 700,
-    cursor: "pointer"
-  },
-  secondaryButton: {
-    height: 42,
-    border: "1px solid #d1d5db",
-    borderRadius: 14,
-    padding: "0 18px",
-    background: "white",
-    color: "#374151",
-    fontSize: 14,
-    fontWeight: 700,
-    cursor: "pointer"
-  }
-};
