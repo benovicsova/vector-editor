@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 
 import { CANVAS_WIDTH, CANVAS_HEIGHT, TOOL } from "../constants";
 import { clamp, distance, getBoundingBox, uid } from "../utils/geometry";
@@ -60,8 +60,12 @@ export default function EditorCanvas({
   lockedShapes = [],
   focusedShapes = [],
   lockShape,
-  unlockShape
+  unlockShape,
+  eyedropperTarget = null,
+  onPickColorFromShape
 }) {
+  const svgRef = useRef(null);
+
   const [camera, setCamera] = useState({
     x: CANVAS_WIDTH / 2,
     y: CANVAS_HEIGHT / 2
@@ -69,6 +73,7 @@ export default function EditorCanvas({
 
   const [eraserPosition, setEraserPosition] = useState(null);
   const [textEditor, setTextEditor] = useState(null);
+  const [eyedropperPreview, setEyedropperPreview] = useState(null);
 
   const updateShapesLive = setShapesLive || setShapes;
 
@@ -160,13 +165,35 @@ export default function EditorCanvas({
     return shapeIds.some((shapeId) => isLocked(shapeId));
   }
 
-  function screenPointToSvgPoint(event, svg) {
+  function screenPointToSvgPoint(event, svgElement) {
+    const svg =
+      svgRef.current ||
+      svgElement?.ownerSVGElement ||
+      svgElement?.closest?.("svg") ||
+      svgElement;
+
+    if (!svg || typeof svg.createSVGPoint !== "function") {
+      return {
+        x: event.clientX,
+        y: event.clientY
+      };
+    }
+
+    const screenMatrix = svg.getScreenCTM();
+
+    if (!screenMatrix) {
+      return {
+        x: event.clientX,
+        y: event.clientY
+      };
+    }
+
     const point = svg.createSVGPoint();
 
     point.x = event.clientX;
     point.y = event.clientY;
 
-    const transformedPoint = point.matrixTransform(svg.getScreenCTM().inverse());
+    const transformedPoint = point.matrixTransform(screenMatrix.inverse());
 
     return {
       x: transformedPoint.x,
@@ -179,8 +206,134 @@ export default function EditorCanvas({
   }
 
   function getPointerFromSvg(event) {
-    const svg = event.currentTarget.ownerSVGElement;
-    return screenPointToSvgPoint(event, svg);
+    return screenPointToSvgPoint(event, event.currentTarget);
+  }
+
+  function distanceToSegment(point, start, end) {
+    const dx = end.x - start.x;
+    const dy = end.y - start.y;
+    const lengthSquared = dx * dx + dy * dy;
+
+    if (lengthSquared === 0) return distance(point, start);
+
+    const t = Math.max(
+      0,
+      Math.min(1, ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared)
+    );
+
+    return distance(point, {
+      x: start.x + t * dx,
+      y: start.y + t * dy
+    });
+  }
+
+  function pointInPolygon(point, points = []) {
+    if (points.length < 3) return false;
+
+    let inside = false;
+
+    for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
+      const pi = points[i];
+      const pj = points[j];
+
+      const intersects =
+        pi.y > point.y !== pj.y > point.y &&
+        point.x < ((pj.x - pi.x) * (point.y - pi.y)) / (pj.y - pi.y || 1) + pi.x;
+
+      if (intersects) inside = !inside;
+    }
+
+    return inside;
+  }
+
+  function isPointNearPolyline(point, points = [], tolerance = 8) {
+    if (points.length === 0) return false;
+    if (points.length === 1) return distance(point, points[0]) <= tolerance;
+
+    for (let i = 0; i < points.length - 1; i++) {
+      if (distanceToSegment(point, points[i], points[i + 1]) <= tolerance) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  function getPointInShapeCoordinates(shape, point) {
+    const rotation = getRotation(shape);
+
+    if (!rotation) return point;
+
+    return unrotatePoint(point, getShapeCenter(shape), rotation);
+  }
+
+  function shapeContainsPoint(shape, point) {
+    const localPoint = getPointInShapeCoordinates(shape, point);
+    const box = getBoundingBox(shape);
+    const tolerance = Math.max((Number(shape.strokeWidth) || 1) / 2 + 6 / zoom, 6 / zoom);
+
+    if (shape.type === "rect") {
+      return (
+        localPoint.x >= box.x - tolerance &&
+        localPoint.x <= box.x + box.w + tolerance &&
+        localPoint.y >= box.y - tolerance &&
+        localPoint.y <= box.y + box.h + tolerance
+      );
+    }
+
+    if (shape.type === "ellipse") {
+      const cx = shape.x + shape.w / 2;
+      const cy = shape.y + shape.h / 2;
+      const rx = Math.max(Math.abs(shape.w / 2), 0.1);
+      const ry = Math.max(Math.abs(shape.h / 2), 0.1);
+
+      const normalized =
+        ((localPoint.x - cx) * (localPoint.x - cx)) / (rx * rx) +
+        ((localPoint.y - cy) * (localPoint.y - cy)) / (ry * ry);
+
+      return normalized <= 1.12;
+    }
+
+    if (shape.type === "triangle" || shape.type === "quad") {
+      return (
+        pointInPolygon(localPoint, shape.points || []) ||
+        isPointNearPolyline(localPoint, [...(shape.points || []), shape.points?.[0]].filter(Boolean), tolerance)
+      );
+    }
+
+    if (shape.type === "line") {
+      return isPointNearPolyline(localPoint, shape.points || [], tolerance);
+    }
+
+    if (shape.type === "pen") {
+      if (isClosedPen(shape) && pointInPolygon(localPoint, shape.points || [])) {
+        return true;
+      }
+
+      return isPointNearPolyline(localPoint, shape.points || [], tolerance);
+    }
+
+    if (shape.type === "text") {
+      return (
+        localPoint.x >= box.x - tolerance &&
+        localPoint.x <= box.x + box.w + tolerance &&
+        localPoint.y >= box.y - tolerance &&
+        localPoint.y <= box.y + box.h + tolerance
+      );
+    }
+
+    return false;
+  }
+
+  function getShapeAtPoint(point) {
+    for (let i = shapes.length - 1; i >= 0; i--) {
+      const shape = shapes[i];
+
+      if (shape.visible === false) continue;
+      if (shapeContainsPoint(shape, point)) return shape;
+    }
+
+    return null;
   }
 
   function eraseAt(point) {
@@ -507,6 +660,21 @@ export default function EditorCanvas({
       return;
     }
 
+    if (eyedropperTarget) {
+      event.preventDefault();
+      const pickedShape = getShapeAtPoint(point);
+
+      if (pickedShape) {
+        onPickColorFromShape?.(
+          pickedShape,
+          getEyedropperColorFromShape(pickedShape, point)
+        );
+      }
+
+      setEyedropperPreview(null);
+      return;
+    }
+
     if (tool === TOOL.ERASE) {
       prepareLiveHistoryStep();
       clearSelection();
@@ -541,6 +709,130 @@ export default function EditorCanvas({
     startDrawingAt(point, event);
   }
 
+  function getFallbackColorFromShape(shape) {
+    if (!shape) return null;
+
+    if (shape.type === "line") {
+      return shape.stroke && shape.stroke !== "none" ? shape.stroke : null;
+    }
+
+    if (shape.type === "pen") {
+      if (isClosedPen(shape) && shape.fill && shape.fill !== "none") {
+        return shape.fill;
+      }
+
+      return shape.stroke && shape.stroke !== "none" ? shape.stroke : null;
+    }
+
+    if (shape.fill && shape.fill !== "none") return shape.fill;
+    if (shape.stroke && shape.stroke !== "none") return shape.stroke;
+
+    return null;
+  }
+
+  function getEyedropperColorFromShape(shape, point) {
+    if (!shape) return null;
+
+    const localPoint = point ? getPointInShapeCoordinates(shape, point) : null;
+    const box = getBoundingBox(shape);
+    const tolerance = Math.max((Number(shape.strokeWidth) || 1) / 2 + 6 / zoom, 6 / zoom);
+    const hasFill = Boolean(shape.fill && shape.fill !== "none");
+    const hasStroke = Boolean(shape.stroke && shape.stroke !== "none");
+
+    if (!localPoint) {
+      return getFallbackColorFromShape(shape);
+    }
+
+    if (shape.type === "line") {
+      return hasStroke ? shape.stroke : null;
+    }
+
+    if (shape.type === "rect") {
+      const nearLeft = Math.abs(localPoint.x - box.x) <= tolerance;
+      const nearRight = Math.abs(localPoint.x - (box.x + box.w)) <= tolerance;
+      const nearTop = Math.abs(localPoint.y - box.y) <= tolerance;
+      const nearBottom = Math.abs(localPoint.y - (box.y + box.h)) <= tolerance;
+
+      if ((nearLeft || nearRight || nearTop || nearBottom) && hasStroke) {
+        return shape.stroke;
+      }
+
+      if (hasFill) return shape.fill;
+      if (hasStroke) return shape.stroke;
+      return null;
+    }
+
+    if (shape.type === "ellipse") {
+      const cx = shape.x + shape.w / 2;
+      const cy = shape.y + shape.h / 2;
+      const rx = Math.max(Math.abs(shape.w / 2), 0.1);
+      const ry = Math.max(Math.abs(shape.h / 2), 0.1);
+      const normalized =
+        ((localPoint.x - cx) * (localPoint.x - cx)) / (rx * rx) +
+        ((localPoint.y - cy) * (localPoint.y - cy)) / (ry * ry);
+      const strokeBand = Math.max(tolerance / Math.max(rx, ry), 0.02);
+
+      if (Math.abs(normalized - 1) <= strokeBand * 2 && hasStroke) {
+        return shape.stroke;
+      }
+
+      if (normalized <= 1 && hasFill) return shape.fill;
+      if (hasStroke) return shape.stroke;
+      return null;
+    }
+
+    if (shape.type === "triangle" || shape.type === "quad") {
+      const closedPoints = [...(shape.points || []), shape.points?.[0]].filter(Boolean);
+
+      if (isPointNearPolyline(localPoint, closedPoints, tolerance) && hasStroke) {
+        return shape.stroke;
+      }
+
+      if (pointInPolygon(localPoint, shape.points || []) && hasFill) return shape.fill;
+      if (hasStroke) return shape.stroke;
+      return null;
+    }
+
+    if (shape.type === "pen") {
+      if (isClosedPen(shape)) {
+        const closedPoints = [...(shape.points || []), shape.points?.[0]].filter(Boolean);
+
+        if (isPointNearPolyline(localPoint, closedPoints, tolerance) && hasStroke) {
+          return shape.stroke;
+        }
+
+        if (pointInPolygon(localPoint, shape.points || []) && hasFill) return shape.fill;
+        if (hasStroke) return shape.stroke;
+        return null;
+      }
+
+      return hasStroke ? shape.stroke : null;
+    }
+
+    if (shape.type === "text") {
+      if (hasFill) return shape.fill;
+      if (hasStroke) return shape.stroke;
+      return null;
+    }
+
+    return getFallbackColorFromShape(shape);
+  }
+
+  function updateEyedropperPreview(event, shape = null) {
+    if (!eyedropperTarget) return;
+
+    const point = getSvgPoint(event);
+    const pickedShape = shape || getShapeAtPoint(point);
+    const color = getEyedropperColorFromShape(pickedShape, point);
+
+    setEyedropperPreview({
+      x: point.x,
+      y: point.y,
+      color: color || "#ffffff",
+      hasColor: Boolean(color)
+    });
+  }
+
   function handlePointerMove(event) {
     if (dragInfo?.mode === "pan") {
       updatePan(event);
@@ -548,6 +840,11 @@ export default function EditorCanvas({
     }
 
     const point = getSvgPoint(event);
+
+    if (eyedropperTarget) {
+      updateEyedropperPreview(event);
+      return;
+    }
 
     if (tool === TOOL.ERASE) {
       setEraserPosition(point);
@@ -818,6 +1115,18 @@ export default function EditorCanvas({
       return;
     }
 
+    if (eyedropperTarget) {
+      event.preventDefault();
+      const point = getPointerFromSvg(event);
+      const pickedShape = getShapeAtPoint(point) || shape;
+      const pickedColor = getEyedropperColorFromShape(pickedShape, point);
+
+      updateEyedropperPreview(event, pickedShape);
+      onPickColorFromShape?.(pickedShape, pickedColor);
+      setEyedropperPreview(null);
+      return;
+    }
+
     if (isDrawingTool()) {
       const point = getPointerFromSvg(event);
       startDrawingAt(point, event);
@@ -1017,14 +1326,22 @@ export default function EditorCanvas({
   return (
     <main className="scratch-canvas-panel">
       <svg
+        ref={svgRef}
         viewBox={viewBox.value}
-        className={tool === TOOL.ERASE ? "canvas eraser-mode" : "canvas"}
+        className={
+          eyedropperTarget
+            ? "canvas eyedropper-mode"
+            : tool === TOOL.ERASE
+              ? "canvas eraser-mode"
+              : "canvas"
+        }
         onWheel={handleWheel}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
         onPointerLeave={() => {
           setEraserPosition(null);
+          setEyedropperPreview(null);
           handlePointerUp();
         }}
         onContextMenu={(event) => event.preventDefault()}
@@ -1042,6 +1359,7 @@ export default function EditorCanvas({
             <g
               key={shape.id}
               onDoubleClick={(event) => handleShapeDoubleClick(event, shape)}
+              onPointerMove={(event) => updateEyedropperPreview(event, shape)}
             >
               <ShapeRenderer
                 shape={shape}
@@ -1119,6 +1437,46 @@ export default function EditorCanvas({
             strokeWidth={2 / zoom}
             pointerEvents="none"
           />
+        )}
+
+        {eyedropperTarget && eyedropperPreview && (
+          <g pointerEvents="none">
+            <circle
+              cx={eyedropperPreview.x}
+              cy={eyedropperPreview.y}
+              r={12 / zoom}
+              fill="white"
+              stroke="#4c1d95"
+              strokeWidth={2 / zoom}
+            />
+
+            <circle
+              cx={eyedropperPreview.x}
+              cy={eyedropperPreview.y}
+              r={7 / zoom}
+              fill={eyedropperPreview.color}
+              stroke="#cbd5e1"
+              strokeWidth={1 / zoom}
+            />
+
+            <line
+              x1={eyedropperPreview.x - 18 / zoom}
+              y1={eyedropperPreview.y}
+              x2={eyedropperPreview.x + 18 / zoom}
+              y2={eyedropperPreview.y}
+              stroke="#4c1d95"
+              strokeWidth={1.2 / zoom}
+            />
+
+            <line
+              x1={eyedropperPreview.x}
+              y1={eyedropperPreview.y - 18 / zoom}
+              x2={eyedropperPreview.x}
+              y2={eyedropperPreview.y + 18 / zoom}
+              stroke="#4c1d95"
+              strokeWidth={1.2 / zoom}
+            />
+          </g>
         )}
 
         <EditorCanvasSelectionControls

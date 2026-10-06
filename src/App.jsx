@@ -46,6 +46,8 @@ export default function App() {
   const [connectionStatus, setConnectionStatus] = useState("offline");
   const [lockedShapes, setLockedShapes] = useState([]);
   const [focusedShapes, setFocusedShapes] = useState([]);
+  const [eyedropperTarget, setEyedropperTarget] = useState(null);
+  const eyedropperTargetRef = useRef({ mode: null, ids: [] });
 
   const [roomModal, setRoomModal] = useState(null);
   const [joinInput, setJoinInput] = useState("");
@@ -343,8 +345,12 @@ export default function App() {
     if (!color || color === "none") return;
 
     setRecentColors((prev) => {
-      const next = [color, ...prev.filter((item) => item !== color)];
-      return next.slice(0, 5);
+      if (prev.includes(color)) {
+        return prev;
+      }
+
+      const baseColors = prev.length > 0 ? prev : COLOR_PALETTE;
+      return [...baseColors.slice(1), color].slice(0, 5);
     });
   }
 
@@ -360,16 +366,20 @@ export default function App() {
     setSelectedId(uniqueIds[0] || null);
   }
 
-  function isShapeLocked(shapeId) {
-    return lockedShapes.some((item) => item.shapeId === shapeId);
-  }
-
   function getShapeLock(shapeId) {
     return lockedShapes.find((item) => item.shapeId === shapeId) ?? null;
   }
 
   function isOwnPresence(item) {
     return Boolean(item?.socketId && socketRef.current?.id === item.socketId);
+  }
+
+  function isShapeLocked(shapeId) {
+    const lock = getShapeLock(shapeId);
+
+    if (!lock) return false;
+
+    return !isOwnPresence(lock);
   }
 
   function filterOwnPresence(items = []) {
@@ -464,6 +474,7 @@ export default function App() {
 
   function handleToolChange(nextTool) {
     setTool(nextTool);
+    setEyedropperTarget(null);
 
     if (nextTool !== TOOL.SELECT) {
       clearSelection();
@@ -520,8 +531,14 @@ export default function App() {
     });
   }
 
-  function updateSelectedShapeStyle(property, value) {
-    const idsToUpdate = selectedIds.length > 0 ? selectedIds : selectedId ? [selectedId] : [];
+  function updateSelectedShapeStyle(property, value, forcedIds = null) {
+    const idsToUpdate = Array.isArray(forcedIds) && forcedIds.length > 0
+      ? forcedIds
+      : selectedIds.length > 0
+        ? selectedIds
+        : selectedId
+          ? [selectedId]
+          : [];
 
     if (idsToUpdate.length === 0) return;
     if (idsToUpdate.some((id) => isShapeLocked(id))) return;
@@ -530,8 +547,45 @@ export default function App() {
       prev.map((shape) => {
         if (!idsToUpdate.includes(shape.id)) return shape;
 
-        if ((shape.type === "pen" || shape.type === "line") && property === "fill") {
-          if (value === "none") return { ...shape, fill: "none" };
+        if (property === "fill") {
+          if (shape.type === "line") {
+            if (value === "none") return shape;
+            return {
+              ...shape,
+              stroke: value
+            };
+          }
+
+          if (shape.type === "pen") {
+            const first = shape.points?.[0];
+            const last = shape.points?.[shape.points.length - 1];
+            const isClosed =
+              first &&
+              last &&
+              shape.points?.length >= 3 &&
+              Math.hypot(first.x - last.x, first.y - last.y) <= 20;
+
+            if (!isClosed) {
+              if (value === "none") return shape;
+              return {
+                ...shape,
+                stroke: value
+              };
+            }
+
+            return {
+              ...shape,
+              fill: value
+            };
+          }
+
+          if (shape.type === "text") {
+            if (value === "none") return shape;
+            return {
+              ...shape,
+              fill: value
+            };
+          }
 
           return {
             ...shape,
@@ -539,7 +593,7 @@ export default function App() {
           };
         }
 
-        if (shape.type === "text" && property === "stroke") {
+        if (property === "stroke") {
           return {
             ...shape,
             stroke: value
@@ -552,6 +606,79 @@ export default function App() {
         };
       })
     );
+  }
+
+  function getCurrentSelectionIds() {
+    if (selectedIds.length > 0) return selectedIds;
+    if (selectedId) return [selectedId];
+    return [];
+  }
+
+  function handleStartEyedropper(mode) {
+    if (!mode) {
+      eyedropperTargetRef.current = { mode: null, ids: [] };
+      setEyedropperTarget(null);
+      return;
+    }
+
+    const ids = getCurrentSelectionIds();
+
+    eyedropperTargetRef.current = {
+      mode,
+      ids
+    };
+
+    setEyedropperTarget(mode);
+  }
+
+  function getColorFromShapeForEyedropper(shape) {
+    if (!shape) return null;
+
+    if (shape.type === "line") {
+      return shape.stroke && shape.stroke !== "none" ? shape.stroke : null;
+    }
+
+    if (shape.type === "pen") {
+      const first = shape.points?.[0];
+      const last = shape.points?.[shape.points.length - 1];
+      const isClosed =
+        first &&
+        last &&
+        shape.points?.length >= 3 &&
+        Math.hypot(first.x - last.x, first.y - last.y) <= 20;
+
+      if (isClosed && shape.fill && shape.fill !== "none") return shape.fill;
+      if (shape.stroke && shape.stroke !== "none") return shape.stroke;
+      return null;
+    }
+
+    if (shape.fill && shape.fill !== "none") return shape.fill;
+    if (shape.stroke && shape.stroke !== "none") return shape.stroke;
+
+    return null;
+  }
+
+  function handlePickColorFromShape(shape, pickedColorFromPoint) {
+    const target = eyedropperTargetRef.current;
+    const targetMode = target.mode || eyedropperTarget;
+    const targetIds = target.ids?.length ? target.ids : getCurrentSelectionIds();
+
+    if (!targetMode) return;
+
+    const pickedColor = pickedColorFromPoint || getColorFromShapeForEyedropper(shape);
+
+    if (!pickedColor || pickedColor === "none") {
+      handleStartEyedropper(null);
+      return;
+    }
+
+    if (targetMode === "stroke") {
+      handleStrokeChange(pickedColor, { ids: targetIds });
+    } else {
+      handleFillChange(pickedColor, { ids: targetIds });
+    }
+
+    handleStartEyedropper(null);
   }
 
   function updateSelectedTextTypography(property, value) {
@@ -574,16 +701,24 @@ export default function App() {
     });
   }
 
-  function handleFillChange(nextFill) {
+  function handleFillChange(nextFill, options = {}) {
     setFill(nextFill);
-    rememberColor(nextFill);
-    updateSelectedShapeStyle("fill", nextFill);
+
+    if (options.remember !== false && nextFill !== "none") {
+      rememberColor(nextFill);
+    }
+
+    updateSelectedShapeStyle("fill", nextFill, options.ids);
   }
 
-  function handleStrokeChange(nextStroke) {
+  function handleStrokeChange(nextStroke, options = {}) {
     setStroke(nextStroke);
-    rememberColor(nextStroke);
-    updateSelectedShapeStyle("stroke", nextStroke);
+
+    if (options.remember !== false && nextStroke !== "none") {
+      rememberColor(nextStroke);
+    }
+
+    updateSelectedShapeStyle("stroke", nextStroke, options.ids);
   }
 
   function handleStrokeWidthChange(nextStrokeWidth) {
@@ -1115,6 +1250,8 @@ export default function App() {
         recentColors={recentColors}
         strokeWidth={strokeWidth}
         setStrokeWidth={handleStrokeWidthChange}
+        eyedropperTarget={eyedropperTarget}
+        onStartEyedropper={handleStartEyedropper}
         fontFamily={fontFamily}
         setFontFamily={handleFontFamilyChange}
         fontSize={fontSize}
@@ -1189,6 +1326,8 @@ export default function App() {
         focusedShapes={focusedShapes}
         lockShape={lockShape}
         unlockShape={unlockShape}
+        eyedropperTarget={eyedropperTarget}
+        onPickColorFromShape={handlePickColorFromShape}
       />
 
       <RoomModal
