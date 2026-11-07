@@ -1,8 +1,11 @@
 import { TOOL } from "../constants";
+import { getBoundingBox } from "../utils/geometry";
 import {
   getEditPoints,
   getScalePoint,
-  getBoundsCenter
+  getBoundsCenter,
+  getRotation,
+  getShapeCenter
 } from "../utils/editorCanvasGeometry";
 
 export default function EditorCanvasSelectionControls({
@@ -13,6 +16,7 @@ export default function EditorCanvasSelectionControls({
   selectedCenter,
   selectedRotation,
   selectedIds,
+  selectedShapes = [],
   multiSelectionBounds,
   onStartPointDrag,
   onStartRotationDrag,
@@ -30,6 +34,49 @@ export default function EditorCanvasSelectionControls({
 
     return (
       <g>
+        {/* Každý Ctrl-označený objekt zostáva viditeľne označený. */}
+        {selectedShapes.map((shape) => {
+          const bounds = getBoundingBox(shape);
+          const rotation = getRotation(shape);
+          const center = getShapeCenter(shape);
+
+          return (
+            <g
+              key={shape.id}
+              transform={`rotate(${rotation} ${center.x} ${center.y})`}
+              pointerEvents="none"
+            >
+              <rect
+                x={bounds.x - 4 / zoom}
+                y={bounds.y - 4 / zoom}
+                width={Math.max(bounds.w, 0) + 8 / zoom}
+                height={Math.max(bounds.h, 0) + 8 / zoom}
+                fill="none"
+                stroke="#855cd6"
+                strokeWidth={2 / zoom}
+                strokeDasharray={`${5 / zoom} ${3 / zoom}`}
+              />
+              {[
+                [bounds.x, bounds.y],
+                [bounds.x + bounds.w, bounds.y],
+                [bounds.x, bounds.y + bounds.h],
+                [bounds.x + bounds.w, bounds.y + bounds.h]
+              ].map(([x, y], index) => (
+                <rect
+                  key={index}
+                  x={x - 3 / zoom}
+                  y={y - 3 / zoom}
+                  width={6 / zoom}
+                  height={6 / zoom}
+                  fill="white"
+                  stroke="#855cd6"
+                  strokeWidth={1.5 / zoom}
+                />
+              ))}
+            </g>
+          );
+        })}
+
         <rect
           x={multiSelectionBounds.x - 8}
           y={multiSelectionBounds.y - 8}
@@ -71,6 +118,7 @@ export default function EditorCanvasSelectionControls({
         stroke="#855cd6"
         strokeDasharray="8 6"
         strokeWidth={2 / zoom}
+        pointerEvents="none"
       />
 
       <line
@@ -81,6 +129,7 @@ export default function EditorCanvasSelectionControls({
         stroke="#855cd6"
         strokeWidth={2 / zoom}
         strokeDasharray={`${5 / zoom} ${4 / zoom}`}
+        pointerEvents="none"
       />
 
       <circle

@@ -23,7 +23,9 @@ import {
   Diamond,
   Ban,
   Palette,
-  Pipette
+  Pipette,
+  Group,
+  Ungroup
 } from "lucide-react";
 
 import { COLOR_PALETTE, TOOL } from "../constants";
@@ -96,10 +98,14 @@ export default function Toolbar({
   eyedropperTarget,
   onStartEyedropper,
   onExportPng,
-  onExportJson,
-  onImportJson,
+  onExportSvg,
+  onImportSvg,
   onUndo,
   onRedo,
+  onGroup,
+  onUngroup,
+  canGroup = false,
+  canUngroup = false,
   canUndo,
   canRedo,
   zoom,
@@ -109,7 +115,9 @@ export default function Toolbar({
   roomId,
   onCreateRoom,
   onJoinRoom,
-  connectionStatus
+  connectionStatus,
+  roomUsers = [],
+  currentSocketId
 }) {
   const [draftFill, setDraftFill] = useState(fill === "none" ? "#ffffff" : fill);
   const [draftStroke, setDraftStroke] = useState(
@@ -344,6 +352,15 @@ export default function Toolbar({
             </IconButton>
           </ToolbarGroup>
 
+          <ToolbarGroup title="Zoskupovanie">
+            <IconButton onClick={onGroup} disabled={!canGroup} title="Zoskupiť označené objekty (Ctrl + klik)">
+              <Group />
+            </IconButton>
+            <IconButton onClick={onUngroup} disabled={!canUngroup} title="Odskupiť označenú skupinu">
+              <Ungroup />
+            </IconButton>
+          </ToolbarGroup>
+
           <ToolbarGroup title="História">
             <IconButton onClick={onUndo} disabled={!canUndo} title="Späť">
               <Undo2 />
@@ -458,6 +475,37 @@ export default function Toolbar({
               </span>
             )}
 
+            {roomId && roomUsers.length > 0 && (
+              <details className="participants-dropdown">
+                <summary className="participants-summary" title="Zobraziť účastníkov miestnosti">
+                  <span className="participants-list">
+                    {roomUsers.slice(0, 3).map((participant) => (
+                      <span
+                        key={participant.socketId}
+                        className="participant-avatar"
+                        style={{ backgroundColor: participant.userColor || "#855cd6" }}
+                        title={`${participant.userName}${participant.socketId === currentSocketId ? " (ja)" : ""}`}
+                      >
+                        {(participant.userName || "?").trim().slice(0, 1).toUpperCase()}
+                      </span>
+                    ))}
+                  </span>
+                  <span className="participants-count">{roomUsers.length}</span>
+                </summary>
+                <div className="participants-popover">
+                  <strong>Účastníci ({roomUsers.length})</strong>
+                  {roomUsers.map((participant) => (
+                    <div className="participants-person" key={participant.socketId}>
+                      <span className="participant-avatar" style={{ backgroundColor: participant.userColor || "#855cd6" }}>
+                        {(participant.userName || "?").trim().slice(0, 1).toUpperCase()}
+                      </span>
+                      <span>{participant.userName}{participant.socketId === currentSocketId ? " (ja)" : ""}</span>
+                    </div>
+                  ))}
+                </div>
+              </details>
+            )}
+
             <span
               className={
                 connectionStatus === "online"
@@ -469,13 +517,13 @@ export default function Toolbar({
           </ToolbarGroup>
 
           <ToolbarGroup title="Súbor" className="export-tools">
-            <label className="icon-button" title="Otvoriť JSON projekt">
+            <label className="icon-button" title="Otvoriť SVG projekt">
               <Upload />
 
               <input
                 type="file"
-                accept=".json,application/json"
-                onChange={onImportJson}
+                accept=".svg,image/svg+xml"
+                onChange={onImportSvg}
                 style={{ display: "none" }}
               />
             </label>
@@ -484,7 +532,7 @@ export default function Toolbar({
               <Image />
             </IconButton>
 
-            <IconButton onClick={onExportJson} title="Export JSON">
+            <IconButton onClick={onExportSvg} title="Export SVG">
               <Save />
             </IconButton>
           </ToolbarGroup>

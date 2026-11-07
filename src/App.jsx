@@ -11,14 +11,29 @@ import RoomModal from "./components/RoomModal";
 import ProjectNameModal from "./components/ProjectNameModal";
 
 import { duplicateShape } from "./utils/geometry";
-import { exportJson, exportPng } from "./utils/exportProject";
+import { moveShapeByDelta } from "./utils/editorCanvasGeometry";
+import { uid } from "./utils/geometry";
+import { exportPng } from "./utils/exportProject";
+import { exportSvg, parseProjectSvg } from "./utils/svgProject";
+import { buildCanvasPatch, createOwnStep, applyOwnStep } from "./utils/collaborationHistory";
 
 const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || "http://localhost:3001";
+const AUTOSAVE_KEY = "vector-editor:autosave:v2";
+
+function readAutosave() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(AUTOSAVE_KEY) || "null");
+    return parsed && Array.isArray(parsed.shapes) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
 
 export default function App() {
+  const [restoredProject] = useState(readAutosave);
   const [tool, setTool] = useState(TOOL.RECT);
 
-  const [history, setHistory] = useState([initialShapes]);
+  const [history, setHistory] = useState([restoredProject?.shapes || initialShapes]);
   const [historyIndex, setHistoryIndex] = useState(0);
 
   const shapes = history[historyIndex];
@@ -34,7 +49,7 @@ export default function App() {
   const [fontFamily, setFontFamily] = useState("Arial");
   const [fontSize, setFontSize] = useState(32);
 
-  const [projectName, setProjectName] = useState("");
+  const [projectName, setProjectName] = useState(restoredProject?.name || "");
   const [userName, setUserName] = useState("");
 
   const [zoom, setZoom] = useState(1);
@@ -46,6 +61,9 @@ export default function App() {
   const [connectionStatus, setConnectionStatus] = useState("offline");
   const [lockedShapes, setLockedShapes] = useState([]);
   const [focusedShapes, setFocusedShapes] = useState([]);
+  const [roomUsers, setRoomUsers] = useState([]);
+  const [ownUndoCount, setOwnUndoCount] = useState(0);
+  const [ownRedoCount, setOwnRedoCount] = useState(0);
   const [eyedropperTarget, setEyedropperTarget] = useState(null);
   const eyedropperTargetRef = useRef({ mode: null, ids: [] });
 
@@ -68,6 +86,9 @@ export default function App() {
   const historyRef = useRef(history);
   const historyIndexRef = useRef(historyIndex);
   const clipboardRef = useRef(null);
+  const ownUndoRef = useRef([]);
+  const ownRedoRef = useRef([]);
+  const liveEditRef = useRef(null);
 
   const selectedShape = shapes.find((shape) => shape.id === selectedId) ?? null;
 
@@ -85,6 +106,24 @@ export default function App() {
     historyRef.current = history;
     historyIndexRef.current = historyIndex;
   }, [shapes, dragInfo, history, historyIndex]);
+
+  // Auto-save only the project data, never ephemeral locks or presence.
+  useEffect(() => {
+    try {
+      localStorage.setItem(AUTOSAVE_KEY, JSON.stringify({
+        version: 2,
+        name: projectName,
+        shapes,
+        savedAt: new Date().toISOString()
+      }));
+    } catch (error) {
+      console.warn("Automatické uloženie nie je dostupné:", error);
+    }
+  }, [shapes, projectName]);
+
+  useEffect(() => {
+    if (!dragInfo) liveEditRef.current = null;
+  }, [dragInfo]);
 
   useEffect(() => {
     if (!selectedShape) return;
@@ -175,6 +214,7 @@ export default function App() {
       setConnectionStatus("offline");
       setLockedShapes([]);
       setFocusedShapes([]);
+      setRoomUsers([]);
       focusedShapeIdRef.current = "";
       selectionLockIdsRef.current = [];
     });
@@ -207,11 +247,22 @@ export default function App() {
         }
       }
 
+      shapesRef.current = nextShapes;
+      historyRef.current = [nextShapes];
+      historyIndexRef.current = 0;
       setHistory([nextShapes]);
       setHistoryIndex(0);
       setSelectedId((prev) =>
         prev && nextShapes.some((shape) => shape.id === prev) ? prev : null
       );
+    });
+
+    socket.on("user-joined", ({ users }) => {
+      if (Array.isArray(users)) setRoomUsers(users);
+    });
+
+    socket.on("user-left", ({ users }) => {
+      if (Array.isArray(users)) setRoomUsers(users);
     });
 
     socket.on("shape-locked", ({ shapeId, socketId, userName, userColor }) => {
@@ -279,10 +330,35 @@ export default function App() {
         target instanceof HTMLSelectElement ||
         target?.isContentEditable;
 
-      if (isTyping) return;
-
       const key = event.key.toLowerCase();
       const ctrlOrMeta = event.ctrlKey || event.metaKey;
+
+      // Uloženie funguje aj vtedy, keď je kurzor v políčku názvu projektu.
+      if (ctrlOrMeta && key === "s") {
+        event.preventDefault();
+        handleExportPng();
+        return;
+      }
+
+      if (isTyping) return;
+
+      // Posúvanie označených objektov šípkami. Shift = väčší krok.
+      // Nemeníme správanie šípok v textových poliach ani skratky prehliadača.
+      if (!ctrlOrMeta && !event.altKey && [
+        "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"
+      ].includes(event.key)) {
+        const ids = getCurrentSelectionIds();
+        if (ids.length === 0) return;
+
+        event.preventDefault();
+        const step = event.shiftKey ? 10 : 1;
+        const dx = event.key === "ArrowLeft" ? -step
+          : event.key === "ArrowRight" ? step : 0;
+        const dy = event.key === "ArrowUp" ? -step
+          : event.key === "ArrowDown" ? step : 0;
+        moveSelectedWithKeyboard(dx, dy);
+        return;
+      }
 
       if (ctrlOrMeta && key === "z") {
         event.preventDefault();
@@ -308,11 +384,22 @@ export default function App() {
         return;
       }
 
-      if (ctrlOrMeta && key === "c") {
-        if (!selectedShape) return;
+      if (ctrlOrMeta && (key === "c" || key === "x")) {
+        const ids = selectedIds.length > 0
+          ? selectedIds
+          : selectedId ? [selectedId] : [];
+        const selected = shapesRef.current.filter((shape) => ids.includes(shape.id));
+        if (!selected.length) return;
 
         event.preventDefault();
-        clipboardRef.current = structuredClone(selectedShape);
+
+        // With Cut, never copy/delete another participant's locked object.
+        if (key === "x" && selected.some((shape) => isShapeLocked(shape.id))) {
+          return;
+        }
+
+        clipboardRef.current = structuredClone(selected);
+        if (key === "x") deleteSelected();
         return;
       }
 
@@ -335,7 +422,7 @@ export default function App() {
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [selectedId, lockedShapes, selectedShape]);
+  }, [selectedId, selectedIds, lockedShapes, selectedShape, shapes, projectName]);
 
   function getCurrentUserName() {
     return userName.trim() || "Používateľ";
@@ -360,10 +447,16 @@ export default function App() {
   }
 
   function normalizeSelection(ids) {
-    const uniqueIds = Array.from(new Set(ids.filter(Boolean)));
-
-    setSelectedIds(uniqueIds);
-    setSelectedId(uniqueIds[0] || null);
+    const uniqueIds = new Set(ids.filter(Boolean));
+    const grouped = new Set(shapesRef.current
+      .filter((shape) => uniqueIds.has(shape.id) && shape.groupId)
+      .map((shape) => shape.groupId));
+    for (const shape of shapesRef.current) {
+      if (shape.groupId && grouped.has(shape.groupId)) uniqueIds.add(shape.id);
+    }
+    const nextIds = [...uniqueIds];
+    setSelectedIds(nextIds);
+    setSelectedId(nextIds[0] || null);
   }
 
   function getShapeLock(shapeId) {
@@ -411,65 +504,86 @@ export default function App() {
     setLockedShapes((prev) => prev.filter((item) => item.shapeId !== shapeId));
   }
 
-  function syncShapes(nextShapes) {
-    if (!roomIdRef.current) return;
-    if (!socketRef.current) return;
-
+  function syncShapes(nextShapes, beforeShapes) {
+    if (!roomIdRef.current || !socketRef.current) return;
+    const patch = buildCanvasPatch(beforeShapes, nextShapes);
+    if (!patch) return;
     socketRef.current.emit("canvas-update", {
       roomId: roomIdRef.current,
-      shapes: nextShapes
+      patch
     });
+  }
+
+  function updateHistoryControls() {
+    setOwnUndoCount(ownUndoRef.current.length);
+    setOwnRedoCount(ownRedoRef.current.length);
+  }
+
+  function recordOwnStep(before, after, updatingLive = false) {
+    const delta = createOwnStep(before, after);
+    if (!delta) return;
+
+    if (updatingLive && liveEditRef.current?.step) {
+      // Merge only the IDs changed in THIS local pointer update. This avoids
+      // accidentally recording a collaborator's concurrent modification.
+      const combined = new Map(
+        liveEditRef.current.step.entries.map((entry) => [entry.id, entry])
+      );
+      for (const entry of delta.entries) {
+        const previous = combined.get(entry.id);
+        combined.set(entry.id, {
+          id: entry.id,
+          before: previous?.before ?? entry.before,
+          after: entry.after
+        });
+      }
+      const updated = { entries: [...combined.values()] };
+      liveEditRef.current.step = updated;
+      ownUndoRef.current[ownUndoRef.current.length - 1] = updated;
+    } else {
+      ownUndoRef.current.push(delta);
+      if (ownUndoRef.current.length > 100) ownUndoRef.current.shift();
+      ownRedoRef.current = [];
+      if (updatingLive && liveEditRef.current) {
+        liveEditRef.current.step = delta;
+      }
+    }
+    updateHistoryControls();
+  }
+
+  function applyCanvasState(nextShapes, beforeShapes, shouldSync = true) {
+    shapesRef.current = nextShapes;
+    historyRef.current = [nextShapes];
+    historyIndexRef.current = 0;
+    setHistory([nextShapes]);
+    setHistoryIndex(0);
+    if (shouldSync) syncShapes(nextShapes, beforeShapes);
   }
 
   function commitShapes(nextShapes, shouldSync = true) {
-    setHistory((prev) => {
-      const currentIndex = historyIndexRef.current;
-      const sliced = prev.slice(0, currentIndex + 1);
-      const nextHistory = [...sliced, nextShapes];
-
-      historyRef.current = nextHistory;
-      historyIndexRef.current = nextHistory.length - 1;
-
-      return nextHistory;
-    });
-
-    setHistoryIndex((prev) => {
-      const nextIndex = prev + 1;
-      historyIndexRef.current = nextIndex;
-      return nextIndex;
-    });
-
-    shapesRef.current = nextShapes;
-
-    if (shouldSync) {
-      syncShapes(nextShapes);
+    const before = shapesRef.current;
+    // Gesture starts: keep one undo record for the entire drag operation.
+    if (nextShapes === before) {
+      liveEditRef.current = { before: structuredClone(before), step: null };
+      return;
     }
+    liveEditRef.current = null;
+    recordOwnStep(before, nextShapes);
+    applyCanvasState(nextShapes, before, shouldSync);
   }
 
   function setShapesDirect(updater) {
-    const currentShapes = shapesRef.current;
-    const nextShapes =
-      typeof updater === "function" ? updater(currentShapes) : updater;
-
-    commitShapes(nextShapes);
+    const before = shapesRef.current;
+    const after = typeof updater === "function" ? updater(before) : updater;
+    commitShapes(after);
   }
 
   function setShapesLive(updater) {
-    const currentShapes = shapesRef.current;
-    const nextShapes =
-      typeof updater === "function" ? updater(currentShapes) : updater;
-
-    setHistory((prev) => {
-      const nextHistory = prev.map((item, index) =>
-        index === historyIndexRef.current ? nextShapes : item
-      );
-
-      historyRef.current = nextHistory;
-      return nextHistory;
-    });
-
-    shapesRef.current = nextShapes;
-    syncShapes(nextShapes);
+    const before = shapesRef.current;
+    const after = typeof updater === "function" ? updater(before) : updater;
+    if (before === after) return;
+    recordOwnStep(before, after, Boolean(liveEditRef.current));
+    applyCanvasState(after, before);
   }
 
   function handleToolChange(nextTool) {
@@ -612,6 +726,30 @@ export default function App() {
     if (selectedIds.length > 0) return selectedIds;
     if (selectedId) return [selectedId];
     return [];
+  }
+
+  function moveSelectedWithKeyboard(dx, dy) {
+    const initialIds = getCurrentSelectionIds();
+    if (!initialIds.length) return;
+
+    // Ak je označený člen skupiny, posunieme celú skupinu.
+    const ids = new Set(initialIds);
+    const groupIds = new Set(
+      shapesRef.current
+        .filter((shape) => ids.has(shape.id) && shape.groupId)
+        .map((shape) => shape.groupId)
+    );
+    for (const shape of shapesRef.current) {
+      if (shape.groupId && groupIds.has(shape.groupId)) ids.add(shape.id);
+    }
+
+    // V spoločnej miestnosti nesmieme posunúť ani časť skupiny,
+    // keď jej niektorý objekt vlastní iný používateľ.
+    if ([...ids].some((id) => isShapeLocked(id))) return;
+
+    setShapesDirect((previousShapes) => previousShapes.map((shape) =>
+      ids.has(shape.id) ? moveShapeByDelta(shape, dx, dy) : shape
+    ));
   }
 
   function handleStartEyedropper(mode) {
@@ -779,6 +917,11 @@ export default function App() {
         roomIdRef.current = response.roomId;
         setLockedShapes(filterOwnPresence(response.lockedShapes ?? []));
         setFocusedShapes(filterOwnPresence(response.focusedShapes ?? []));
+        setRoomUsers(Array.isArray(response.users) ? response.users : []);
+        ownUndoRef.current = [];
+        ownRedoRef.current = [];
+        liveEditRef.current = null;
+        updateHistoryControls();
 
         setRoomModal({
           type: "created",
@@ -834,6 +977,11 @@ export default function App() {
         roomIdRef.current = response.roomId;
         setLockedShapes(filterOwnPresence(response.lockedShapes ?? []));
         setFocusedShapes(filterOwnPresence(response.focusedShapes ?? []));
+        setRoomUsers(Array.isArray(response.users) ? response.users : []);
+        ownUndoRef.current = [];
+        ownRedoRef.current = [];
+        liveEditRef.current = null;
+        updateHistoryControls();
 
         if (Array.isArray(response.shapes)) {
           setHistory([response.shapes]);
@@ -859,38 +1007,78 @@ export default function App() {
     setRoomError("");
   }
 
-  function undo() {
-    const currentHistory = historyRef.current;
-    const currentIndex = historyIndexRef.current;
+  function performOwnHistory(direction) {
+    liveEditRef.current = null;
+    const source = direction === "undo" ? ownUndoRef.current : ownRedoRef.current;
+    const destination = direction === "undo" ? ownRedoRef.current : ownUndoRef.current;
+    if (source.length === 0) return;
 
-    if (currentIndex <= 0) return;
+    const step = source.pop();
+    const before = shapesRef.current;
+    const lockedIds = new Set(lockedShapes.map((item) => item.shapeId));
+    const result = applyOwnStep(before, step, direction, lockedIds);
 
-    const nextIndex = currentIndex - 1;
-    const nextShapes = currentHistory[nextIndex];
+    if (!result.changed) {
+      // A collaborator changed/locked the affected object. Do not overwrite it.
+      updateHistoryControls();
+      return;
+    }
 
-    historyIndexRef.current = nextIndex;
-    shapesRef.current = nextShapes;
-
-    setHistoryIndex(nextIndex);
+    destination.push(step);
+    updateHistoryControls();
+    applyCanvasState(result.shapes, before);
     clearSelection();
-    syncShapes(nextShapes);
+  }
+
+  // A group is a shared groupId on the original objects. Nothing is flattened,
+  // so SVG/PNG export and collaboration continue to use the original shapes.
+  function groupSelected() {
+    const ids = getCurrentSelectionIds();
+    if (ids.length < 2 || ids.some((id) => isShapeLocked(id))) return;
+
+    // Do not detach a member from an existing group accidentally.
+    const expanded = new Set(ids);
+    for (const shape of shapesRef.current) {
+      if (expanded.has(shape.id) && shape.groupId) {
+        for (const peer of shapesRef.current) {
+          if (peer.groupId === shape.groupId) expanded.add(peer.id);
+        }
+      }
+    }
+    if ([...expanded].some((id) => isShapeLocked(id))) return;
+
+    const groupId = `group-${uid()}`;
+    setShapesDirect((prev) => prev.map((shape) =>
+      expanded.has(shape.id) ? { ...shape, groupId } : shape
+    ));
+    normalizeSelection([...expanded]);
+    setTool(TOOL.SELECT);
+  }
+
+  function ungroupSelected() {
+    const ids = getCurrentSelectionIds();
+    const groups = new Set(shapesRef.current
+      .filter((shape) => ids.includes(shape.id) && shape.groupId)
+      .map((shape) => shape.groupId));
+    if (!groups.size) return;
+    const affected = shapesRef.current.filter((shape) => groups.has(shape.groupId));
+    if (affected.some((shape) => isShapeLocked(shape.id))) return;
+
+    setShapesDirect((prev) => prev.map((shape) => {
+      if (!groups.has(shape.groupId)) return shape;
+      const { groupId, ...ungroupedShape } = shape;
+      return ungroupedShape;
+    }));
+    normalizeSelection(affected.map((shape) => shape.id));
+    setTool(TOOL.SELECT);
+  }
+
+  function undo() {
+    performOwnHistory("undo");
   }
 
   function redo() {
-    const currentHistory = historyRef.current;
-    const currentIndex = historyIndexRef.current;
-
-    if (currentIndex >= currentHistory.length - 1) return;
-
-    const nextIndex = currentIndex + 1;
-    const nextShapes = currentHistory[nextIndex];
-
-    historyIndexRef.current = nextIndex;
-    shapesRef.current = nextShapes;
-
-    setHistoryIndex(nextIndex);
-    clearSelection();
-    syncShapes(nextShapes);
+    performOwnHistory("redo");
   }
 
   function zoomIn() {
@@ -905,80 +1093,105 @@ export default function App() {
     setZoom(1);
   }
 
+  // Duplikáty majú vlastné ID a sú voči originálom posunuté o 12 jednotiek
+  // plátna. Funguje to rovnako pre tvary s x/y aj pre cesty s bodmi.
+  function makeOffsetCopy(shape, offset = 12) {
+    const copy = duplicateShape(shape);
+
+    if (typeof shape.x === "number") copy.x = shape.x + offset;
+    if (typeof shape.y === "number") copy.y = shape.y + offset;
+
+    if (Array.isArray(shape.points)) {
+      copy.points = shape.points.map((point) => ({
+        ...point,
+        x: point.x + offset,
+        y: point.y + offset
+      }));
+    }
+
+    return copy;
+  }
+
   function duplicateSelected() {
-    if (!selectedShape) return;
-    duplicateShapeById(selectedShape.id);
+    const ids = getCurrentSelectionIds();
+    if (!ids.length) return;
+
+    const originals = shapesRef.current.filter((shape) => ids.includes(shape.id));
+    if (!originals.length || originals.some((shape) => isShapeLocked(shape.id))) return;
+
+    const copiedGroupIds = new Map();
+    const copies = originals.map((shape) => {
+      const copy = makeOffsetCopy(shape);
+      copy.name = shape.name ? `${shape.name} kópia` : undefined;
+
+      if (shape.groupId) {
+        if (!copiedGroupIds.has(shape.groupId)) {
+          copiedGroupIds.set(shape.groupId, `group-${uid()}`);
+        }
+        copy.groupId = copiedGroupIds.get(shape.groupId);
+      } else {
+        delete copy.groupId;
+      }
+
+      return copy;
+    });
+
+    // Jeden zápis znamená jeden vlastný krok v histórii Undo/Redo.
+    setShapesDirect((prev) => [...prev, ...copies]);
+    normalizeSelection(copies.map((shape) => shape.id));
+    setTool(TOOL.SELECT);
   }
 
   function duplicateShapeById(shapeId) {
     const shape = shapesRef.current.find((item) => item.id === shapeId);
-    if (!shape) return;
-    if (isShapeLocked(shapeId)) return;
+    if (!shape || isShapeLocked(shapeId)) return;
 
-    clipboardRef.current = structuredClone(shape);
+    // Duplikovanie tlačidlom vrstvy duplikuje len daný objekt.
+    const copy = makeOffsetCopy(shape);
+    delete copy.groupId;
+    copy.name = shape.name ? `${shape.name} kópia` : undefined;
 
-    lockShape(shapeId, () => {
-      const copy = {
-        ...duplicateShape(shape),
-        name: shape.name ? `${shape.name} kópia` : undefined
-      };
-
-      const nextShapes = [...shapesRef.current, copy];
-
-      setShapesDirect(nextShapes);
-      normalizeSelection([copy.id]);
-      setTool(TOOL.SELECT);
-      unlockShape(shapeId);
-    });
+    setShapesDirect((prev) => [...prev, copy]);
+    normalizeSelection([copy.id]);
+    setTool(TOOL.SELECT);
   }
 
   function pasteShape() {
     if (!clipboardRef.current) return;
 
-    const copy = duplicateShape(clipboardRef.current);
-    const nextShapes = [...shapesRef.current, copy];
+    const originals = Array.isArray(clipboardRef.current)
+      ? clipboardRef.current
+      : [clipboardRef.current];
+    if (originals.length === 0) return;
 
-    clipboardRef.current = structuredClone(copy);
-
-    setShapesDirect(nextShapes);
-    normalizeSelection([copy.id]);
+    // Keep a full copy of each original object. Each paste creates fresh IDs
+    // and moves the entire selection by the same offset.
+    const copiedGroupIds = new Map();
+    const copies = originals.map((shape) => {
+      const copy = duplicateShape(shape);
+      if (shape.groupId) {
+        if (!copiedGroupIds.has(shape.groupId)) copiedGroupIds.set(shape.groupId, `group-${uid()}`);
+        copy.groupId = copiedGroupIds.get(shape.groupId);
+      }
+      return copy;
+    });
+    setShapesDirect((prev) => [...prev, ...copies]);
+    clipboardRef.current = structuredClone(copies);
+    normalizeSelection(copies.map((shape) => shape.id));
+    setTool(TOOL.SELECT);
   }
 
   function deleteSelected() {
     const idsToDelete = selectedIds.length > 0 ? selectedIds : selectedId ? [selectedId] : [];
-
-    if (idsToDelete.length === 0) return;
-
-    const currentShapes = shapesRef.current;
-    const orderedIds = currentShapes
+    if (!idsToDelete.length) return;
+    const allowedIds = shapesRef.current
       .filter((shape) => idsToDelete.includes(shape.id) && !isShapeLocked(shape.id))
-      .map((shape) => shape.id)
-      .reverse();
+      .map((shape) => shape.id).reverse();
 
-    if (orderedIds.length === 0) return;
-
-    const nextHistoryItems = [];
-    let workingShapes = currentShapes;
-
-    for (const shapeId of orderedIds) {
-      workingShapes = workingShapes.filter((shape) => shape.id !== shapeId);
-      nextHistoryItems.push(workingShapes);
+    // Record EACH deletion as a separate own undo operation.
+    for (const shapeId of allowedIds) {
+      setShapesDirect((prev) => prev.filter((shape) => shape.id !== shapeId));
     }
-
-    const currentIndex = historyIndexRef.current;
-    const nextHistory = [
-      ...historyRef.current.slice(0, currentIndex + 1),
-      ...nextHistoryItems
-    ];
-    const nextIndex = nextHistory.length - 1;
-
-    historyRef.current = nextHistory;
-    historyIndexRef.current = nextIndex;
-    shapesRef.current = workingShapes;
-
-    setHistory(nextHistory);
-    setHistoryIndex(nextIndex);
-    syncShapes(workingShapes);
     clearSelection();
   }
 
@@ -1075,6 +1288,23 @@ export default function App() {
     });
   }
 
+  function reorderLayers(draggedId, targetId, insertAfter = false) {
+    if (!draggedId || !targetId || draggedId === targetId) return;
+    if (isShapeLocked(draggedId) || isShapeLocked(targetId)) return;
+
+    setShapesDirect((prev) => {
+      const from = prev.findIndex((shape) => shape.id === draggedId);
+      if (from < 0) return prev;
+      const next = [...prev];
+      const [moved] = next.splice(from, 1);
+      const to = next.findIndex((shape) => shape.id === targetId);
+      if (to < 0) return prev;
+      // The panel shows layers in reverse order (frontmost first).
+      next.splice(to + (insertAfter ? 0 : 1), 0, moved);
+      return next;
+    });
+  }
+
   function toggleVisible() {
     if (!selectedShape) return;
     toggleShapeVisibleFromPanel(selectedShape.id);
@@ -1107,6 +1337,7 @@ export default function App() {
   }
 
   function renameShapeFromPanel(shapeId, nextName) {
+    if (isShapeLocked(shapeId)) return;
     setShapesLive((prev) =>
       prev.map((shape) =>
         shape.id === shapeId
@@ -1136,6 +1367,7 @@ export default function App() {
   }
 
   function focusPanelInput(shapeId) {
+    if (isShapeLocked(shapeId)) return;
     normalizeSelection([shapeId]);
     setTool(TOOL.SELECT);
   }
@@ -1169,16 +1401,16 @@ export default function App() {
     });
   }
 
-  function handleExportJson() {
+  function handleExportSvg() {
     const normalizedName = projectName.trim();
 
     if (!normalizedName) {
       setProjectNameDraft("");
-      setProjectNameModal({ action: "json" });
+      setProjectNameModal({ action: "svg" });
       return;
     }
 
-    exportJson({ shapes, projectName: normalizedName, setProjectName });
+    exportSvg({ shapes, projectName: normalizedName });
   }
 
   function confirmProjectNameModal() {
@@ -1194,48 +1426,43 @@ export default function App() {
       });
     }
 
-    if (projectNameModal?.action === "json") {
-      exportJson({ shapes, projectName: normalizedName, setProjectName });
+    if (projectNameModal?.action === "svg") {
+      exportSvg({ shapes, projectName: normalizedName });
     }
   }
 
-  function handleImportJson(event) {
+  async function handleImportSvg(event) {
     const file = event.target.files?.[0];
+    event.target.value = "";
     if (!file) return;
 
-    const reader = new FileReader();
-
-    reader.onload = () => {
-      try {
-        const data = JSON.parse(reader.result);
-
-        if (Array.isArray(data)) {
-          commitShapes(data);
-          clearSelection();
-          setDraft(null);
-          setDragInfo(null);
-          setShowObjectsPanel(true);
-          return;
-        }
-
-        if (Array.isArray(data.shapes)) {
-          commitShapes(data.shapes);
-          setProjectName(data.name || "");
-          clearSelection();
-          setDraft(null);
-          setDragInfo(null);
-          setShowObjectsPanel(true);
-          return;
-        }
-
-        alert("Tento JSON súbor nemá správny formát projektu.");
-      } catch {
-        alert("Import JSON súboru zlyhal.");
+    try {
+      const result = parseProjectSvg(await file.text());
+      if (roomIdRef.current && !window.confirm("Načítaním SVG nahradíš spoločné plátno v aktuálnej miestnosti. Pokračovať?")) return;
+      if (result.warnings.length > 0) {
+        const accepted = window.confirm(
+          `Niektoré prvky SVG nie sú podporované a pri importe sa vynechajú:\n` +
+          result.warnings.slice(0, 5).join("\n") +
+          `\n\nChceš importovať iba podporované objekty?`
+        );
+        if (!accepted) return;
       }
-    };
 
-    reader.readAsText(file);
-    event.target.value = "";
+      // Load only after successful parse and explicit confirmation.
+      ownUndoRef.current = [];
+      ownRedoRef.current = [];
+      liveEditRef.current = null;
+      updateHistoryControls();
+      commitShapes(result.shapes);
+      setProjectName(result.name || file.name.replace(/\.svg$/i, ""));
+      clearSelection();
+      setDraft(null);
+      setDragInfo(null);
+      setShowObjectsPanel(true);
+    } catch (error) {
+      console.error("Import SVG zlyhal:", error);
+      alert(error?.message || "Import SVG súboru zlyhal.");
+    }
   }
 
   return (
@@ -1259,12 +1486,16 @@ export default function App() {
         projectName={projectName}
         setProjectName={setProjectName}
         onExportPng={handleExportPng}
-        onExportJson={handleExportJson}
-        onImportJson={handleImportJson}
+        onExportSvg={handleExportSvg}
+        onImportSvg={handleImportSvg}
         onUndo={undo}
         onRedo={redo}
-        canUndo={historyIndex > 0}
-        canRedo={historyIndex < history.length - 1}
+        onGroup={groupSelected}
+        onUngroup={ungroupSelected}
+        canGroup={getCurrentSelectionIds().length > 1 && getCurrentSelectionIds().every((id) => !isShapeLocked(id))}
+        canUngroup={getCurrentSelectionIds().some((id) => shapes.some((shape) => shape.id === id && shape.groupId))}
+        canUndo={ownUndoCount > 0}
+        canRedo={ownRedoCount > 0}
         selectedShape={selectedShape}
         onDuplicate={duplicateSelected}
         onDelete={deleteSelected}
@@ -1281,6 +1512,8 @@ export default function App() {
         onCreateRoom={createRoom}
         onJoinRoom={openJoinRoomModal}
         connectionStatus={connectionStatus}
+        roomUsers={roomUsers}
+        currentSocketId={socketRef.current?.id}
         showObjectsPanel={showObjectsPanel}
         onToggleObjectsPanel={() => setShowObjectsPanel((prev) => !prev)}
       />
@@ -1298,6 +1531,8 @@ export default function App() {
         onDeleteShape={deleteShapeById}
         onMoveLayer={moveLayerById}
         onMoveLayerToExtreme={moveLayerToExtremeById}
+        onReorderLayers={reorderLayers}
+        lockedShapeIds={lockedShapes.map((lock) => lock.shapeId)}
         onFocusInput={focusPanelInput}
       />
 

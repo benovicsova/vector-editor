@@ -236,18 +236,49 @@ io.on("connection", (socket) => {
     );
   });
 
-  socket.on("canvas-update", ({ roomId, shapes }) => {
+  socket.on("canvas-update", ({ roomId, patch, shapes }) => {
     const normalizedRoomId = String(roomId || "").trim();
     const room = getRoom(normalizedRoomId);
+    if (!room || !room.users.has(socket.id)) return;
 
-    if (!room) return;
-    if (!Array.isArray(shapes)) return;
+    // Keep the older protocol for clients that have not yet updated.
+    if (!patch && Array.isArray(shapes)) {
+      room.shapes = shapes;
+      socket.to(normalizedRoomId).emit("canvas-update", { shapes: room.shapes });
+      return;
+    }
+    if (!patch || !Array.isArray(patch.upserts) || !Array.isArray(patch.removedIds)) return;
 
-    room.shapes = shapes;
+    const mayModify = (id) => {
+      const lock = room.locks.get(id);
+      return !lock || lock.socketId === socket.id;
+    };
 
-    socket.to(normalizedRoomId).emit("canvas-update", {
-      shapes
-    });
+    // Apply only modified objects, never a stale full-canvas snapshot.
+    const deletions = new Set(patch.removedIds.filter((id) => typeof id === "string" && mayModify(id)));
+    let merged = room.shapes.filter((shape) => !deletions.has(shape.id));
+    for (const shape of patch.upserts) {
+      if (!shape || typeof shape.id !== "string" || !mayModify(shape.id)) continue;
+      const index = merged.findIndex((item) => item.id === shape.id);
+      if (index >= 0) merged[index] = shape;
+      else merged.push(shape);
+    }
+
+    if (Array.isArray(patch.order)) {
+      const indices = new Map(patch.order.map((id, i) => [id, i]));
+      merged = merged.map((shape, originalIndex) => ({ shape, originalIndex }))
+        .sort((a, b) => {
+          const ai = indices.get(a.shape.id);
+          const bi = indices.get(b.shape.id);
+          if (ai == null || bi == null) return a.originalIndex - b.originalIndex;
+          return ai - bi;
+        })
+        .map(({ shape }) => shape);
+    }
+
+    room.shapes = merged;
+    // All clients converge on the authoritative merged state.
+    io.to(normalizedRoomId).emit("canvas-update", { shapes: merged });
   });
 
   socket.on("shape-lock", ({ roomId, shapeId, userName }, callback) => {
@@ -256,7 +287,7 @@ io.on("connection", (socket) => {
 
     const room = getRoom(normalizedRoomId);
 
-    if (!room || !normalizedShapeId) {
+    if (!room || !normalizedShapeId || !room.users.has(socket.id)) {
       callback?.({
         success: false,
         message: "Tvar sa nepodarilo zamknúť."

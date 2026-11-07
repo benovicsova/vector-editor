@@ -8,9 +8,11 @@ import {
   ChevronsUp,
   ChevronsDown,
   PanelRightClose,
-  PanelRightOpen
+  PanelRightOpen,
+  GripVertical
 } from "lucide-react";
 
+import { useState } from "react";
 import ShapeThumbnail from "./ShapeThumbnail";
 
 export default function ObjectsPanel({
@@ -26,8 +28,12 @@ export default function ObjectsPanel({
   onDeleteShape,
   onMoveLayer,
   onMoveLayerToExtreme,
-  onFocusInput
+  onFocusInput,
+  onReorderLayers,
+  lockedShapeIds = []
 }) {
+  const [draggedId, setDraggedId] = useState(null);
+  const [hoveredId, setHoveredId] = useState(null);
   return (
     <>
       <button
@@ -64,8 +70,40 @@ export default function ObjectsPanel({
             .map(({ shape, index }) => (
               <div
                 key={shape.id}
-                className={selectedId === shape.id ? "objects-item selected" : "objects-item"}
+                className={[
+                  "objects-item",
+                  selectedId === shape.id ? "selected" : "",
+                  hoveredId === shape.id && draggedId !== shape.id ? "drop-target" : "",
+                  draggedId === shape.id ? "dragged" : ""
+                ].filter(Boolean).join(" ")}
+                draggable={!lockedShapeIds.includes(shape.id)}
+                onDragStart={(event) => {
+                  if (lockedShapeIds.includes(shape.id)) { event.preventDefault(); return; }
+                  setDraggedId(shape.id);
+                  event.dataTransfer.effectAllowed = "move";
+                  event.dataTransfer.setData("text/plain", shape.id);
+                }}
+                onDragOver={(event) => {
+                  if (!draggedId || lockedShapeIds.includes(shape.id)) return;
+                  event.preventDefault();
+                  event.dataTransfer.dropEffect = "move";
+                  setHoveredId(shape.id);
+                }}
+                onDrop={(event) => {
+                  event.preventDefault();
+                  const source = event.dataTransfer.getData("text/plain") || draggedId;
+                  const bounds = event.currentTarget.getBoundingClientRect();
+                  // Upper half: place this layer above the hovered layer.
+                  const placeBelow = event.clientY > bounds.top + bounds.height / 2;
+                  if (source && source !== shape.id) onReorderLayers?.(source, shape.id, placeBelow);
+                  setDraggedId(null);
+                  setHoveredId(null);
+                }}
+                onDragEnd={() => { setDraggedId(null); setHoveredId(null); }}
               >
+                <span className="objects-drag-handle" title="Potiahni objekt vyššie alebo nižšie">
+                  <GripVertical size={15} />
+                </span>
                 <button
                   className="objects-thumbnail-button"
                   type="button"

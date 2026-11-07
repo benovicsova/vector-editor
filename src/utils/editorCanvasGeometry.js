@@ -425,11 +425,58 @@ export function getBoundsCenter(bounds) {
   };
 }
 
+function pointInRect(point, bounds, padding = 0) {
+  return point.x >= bounds.x - padding &&
+    point.x <= bounds.x + bounds.w + padding &&
+    point.y >= bounds.y - padding &&
+    point.y <= bounds.y + bounds.h + padding;
+}
+
+function segmentsIntersect(a, b, c, d) {
+  const cross = (p, q, r) => (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x);
+  const x1 = cross(a, b, c);
+  const x2 = cross(a, b, d);
+  const x3 = cross(c, d, a);
+  const x4 = cross(c, d, b);
+  const overlap = Math.max(Math.min(a.x, b.x), Math.min(c.x, d.x)) <=
+    Math.min(Math.max(a.x, b.x), Math.max(c.x, d.x)) &&
+    Math.max(Math.min(a.y, b.y), Math.min(c.y, d.y)) <=
+    Math.min(Math.max(a.y, b.y), Math.max(c.y, d.y));
+  return overlap && (x1 * x2 <= 0) && (x3 * x4 <= 0);
+}
+
+function segmentIntersectsRect(a, b, bounds, padding = 0) {
+  if (pointInRect(a, bounds, padding) || pointInRect(b, bounds, padding)) return true;
+  const x = bounds.x - padding;
+  const y = bounds.y - padding;
+  const w = bounds.w + 2 * padding;
+  const h = bounds.h + 2 * padding;
+  const corners = [
+    { x, y }, { x: x + w, y }, { x: x + w, y: y + h }, { x, y: y + h }
+  ];
+  return corners.some((corner, i) => segmentsIntersect(a, b, corner, corners[(i + 1) % 4]));
+}
+
 export function shapeIntersectsBounds(shape, bounds) {
   if (!bounds) return false;
 
-  const box = getBoundingBox(shape);
+  // Freehand strokes and straight lines are selected only if the selection
+  // rectangle actually touches their path, not their large bounding box.
+  if ((shape.type === "line" || shape.type === "pen") && shape.points?.length) {
+    const rotation = Number(shape.rotation) || 0;
+    const center = getShapeCenter(shape);
+    const points = rotation
+      ? shape.points.map((point) => rotatePoint(point, center, rotation))
+      : shape.points;
+    const tolerance = Math.max((Number(shape.strokeWidth) || 1) / 2, 3);
+    if (points.length === 1) return pointInRect(points[0], bounds, tolerance);
+    for (let i = 1; i < points.length; i++) {
+      if (segmentIntersectsRect(points[i - 1], points[i], bounds, tolerance)) return true;
+    }
+    return false;
+  }
 
+  const box = getBoundingBox(shape);
   return !(
     box.x + box.w < bounds.x ||
     box.x > bounds.x + bounds.w ||

@@ -119,11 +119,24 @@ export default function EditorCanvas({
 
   const style = { fill, stroke, strokeWidth };
 
-  function setSelection(nextIds) {
-    const uniqueIds = Array.from(
-      new Set(nextIds.filter((id) => shapes.some((shape) => shape.id === id)))
-    );
+  function groupMemberIds(shape) {
+    if (!shape?.groupId) return shape ? [shape.id] : [];
+    return shapes.filter((item) => item.groupId === shape.groupId).map((item) => item.id);
+  }
 
+  function expandGroupIds(ids) {
+    const expanded = new Set(ids.filter((id) => shapes.some((shape) => shape.id === id)));
+    const groupIds = new Set(shapes
+      .filter((shape) => expanded.has(shape.id) && shape.groupId)
+      .map((shape) => shape.groupId));
+    for (const shape of shapes) {
+      if (shape.groupId && groupIds.has(shape.groupId)) expanded.add(shape.id);
+    }
+    return [...expanded];
+  }
+
+  function setSelection(nextIds) {
+    const uniqueIds = expandGroupIds(nextIds);
     setSelectedIds?.(uniqueIds);
     setSelectedId(uniqueIds[0] || null);
   }
@@ -560,7 +573,8 @@ export default function EditorCanvas({
   }
 
   function focusShape(shape, append = false) {
-    if (isLocked(shape.id)) return;
+    const members = groupMemberIds(shape);
+    if (anyLocked(members)) return;
 
     setTool(TOOL.SELECT);
     setDraft(null);
@@ -568,16 +582,15 @@ export default function EditorCanvas({
     setEraserPosition(null);
 
     if (append) {
-      const baseIds = normalizedSelectedIds.length > 0 ? normalizedSelectedIds : selectedId ? [selectedId] : [];
-      const nextIds = baseIds.includes(shape.id)
-        ? baseIds.filter((id) => id !== shape.id)
-        : [...baseIds, shape.id];
-
-      setSelection(nextIds);
+      const baseIds = normalizedSelectedIds;
+      const isSelected = members.every((id) => baseIds.includes(id));
+      setSelection(isSelected
+        ? baseIds.filter((id) => !members.includes(id))
+        : [...baseIds, ...members]);
       return;
     }
 
-    setSelection([shape.id]);
+    setSelection(members);
   }
 
   function finishActiveEdit() {
@@ -1030,7 +1043,9 @@ export default function EditorCanvas({
           ? Array.from(new Set([...(dragInfo.originalIds || []), ...idsInside]))
           : idsInside;
 
-        setSelection(nextIds.filter((shapeId) => !isLocked(shapeId)));
+        const expanded = expandGroupIds(nextIds);
+        setSelection(expanded.filter((shapeId) => !isLocked(shapeId)));
+
       }
     }
 
@@ -1187,6 +1202,27 @@ export default function EditorCanvas({
     }
 
     const point = getPointerFromSvg(event);
+
+    // Clicking any member of a group selects and drags the entire group.
+    // The same multi-shape drag is reused, preserving coordinates and styles.
+    if (shape.groupId) {
+      const members = groupMemberIds(shape);
+      if (anyLocked(members)) return;
+      const movingIds = normalizedSelectedIds.includes(shape.id)
+        ? normalizedSelectedIds
+        : members;
+      setSelection(movingIds);
+      prepareLiveHistoryStep();
+      setDragInfo({
+        mode: "move-selection",
+        shapeIds: movingIds,
+        start: point,
+        originalShapes: shapes
+          .filter((item) => movingIds.includes(item.id))
+          .map((item) => structuredClone(item))
+      });
+      return;
+    }
 
     if (normalizedSelectedIds.length > 1 && normalizedSelectedIds.includes(shape.id)) {
       if (anyLocked(normalizedSelectedIds)) return;
@@ -1363,6 +1399,7 @@ export default function EditorCanvas({
             >
               <ShapeRenderer
                 shape={shape}
+                zoom={zoom}
                 locked={Boolean(lock)}
                 onPointerDown={(event) => handleShapePointerDown(event, shape)}
               />
@@ -1487,6 +1524,7 @@ export default function EditorCanvas({
           selectedCenter={selectedCenter}
           selectedRotation={selectedRotation}
           selectedIds={normalizedSelectedIds}
+          selectedShapes={multipleSelectedShapes}
           multiSelectionBounds={multiSelectionBounds}
           onStartPointDrag={startPointDrag}
           onStartRotationDrag={startRotationDrag}

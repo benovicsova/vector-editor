@@ -1130,3 +1130,23 @@ button {
 .canvas.eyedropper-mode {
   cursor: crosshair;
 }
+
+/* Participants in shared editing rooms */
+.participants-list { display: flex; align-items: center; gap: 3px; padding: 0 4px; flex-shrink: 0; }
+.participant-avatar { display: inline-flex; align-items: center; justify-content: center; width: 27px; height: 27px; color: white; border: 2px solid white; border-radius: 50%; font-size: 12px; font-weight: 800; box-shadow: 0 0 0 1px rgba(0,0,0,.08); }
+.participant-avatar + .participant-avatar { margin-left: -8px; }
+.participants-count { font-size: 12px; color: #64748b; font-weight: 700; min-width: 13px; text-align: center; }
+/* Drag-and-drop layer order */
+.objects-item { grid-template-columns: 16px 38px minmax(65px, 1fr) auto; }
+.objects-drag-handle { display: flex; align-items: center; justify-content: center; color: #94a3b8; cursor: grab; }
+.objects-item.dragged { opacity: .45; }
+.objects-item.drop-target { outline: 2px dashed #855cd6; background: #f3f0ff; }
+
+.participants-dropdown { position: relative; flex-shrink: 0; }
+.participants-summary { display: flex; align-items: center; cursor: pointer; list-style: none; border-radius: 9px; padding: 1px 4px; background: #fff; height: 32px; }
+.participants-summary::-webkit-details-marker { display: none; }
+.participants-summary:hover { background: #f3f0ff; }
+.participants-popover { position: fixed; z-index: 10000; top: 56px; right: 112px; width: 228px; max-width: calc(100vw - 20px); padding: 13px; border: 1px solid #e5e7eb; border-radius: 12px; box-shadow: 0 18px 40px rgba(15, 23, 42, .18); background: white; color: #334155; white-space: normal; }
+.participants-popover strong { display: block; margin-bottom: 8px; font-size: 13px; }
+.participants-person { display: flex; align-items: center; gap: 8px; margin: 5px 0; font-size: 13px; overflow-wrap: anywhere; }
+.participants-person .participant-avatar { margin: 0; flex-shrink: 0; }
