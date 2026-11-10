@@ -342,6 +342,21 @@ export default function App() {
 
       if (isTyping) return;
 
+      // Ctrl/Cmd + A: označí všetky viditeľné objekty na plátne.
+      // Pri zoskupených tvaroch normalizeSelection zachová celú skupinu.
+      if (ctrlOrMeta && key === "a") {
+        event.preventDefault();
+        if (event.repeat) return;
+
+        const allVisibleIds = shapesRef.current
+          .filter((shape) => shape.visible !== false)
+          .map((shape) => shape.id);
+
+        normalizeSelection(allVisibleIds);
+        setTool(TOOL.SELECT);
+        return;
+      }
+
       // Posúvanie označených objektov šípkami. Shift = väčší krok.
       // Nemeníme správanie šípok v textových poliach ani skratky prehliadača.
       if (!ctrlOrMeta && !event.altKey && [
@@ -1015,7 +1030,13 @@ export default function App() {
 
     const step = source.pop();
     const before = shapesRef.current;
-    const lockedIds = new Set(lockedShapes.map((item) => item.shapeId));
+    // Vlastný výber býva tiež zamknutý na serveri, ale nesmie blokovať
+    // vlastné undo/redo. Blokujeme iba zámky cudzích používateľov.
+    const lockedIds = new Set(
+      lockedShapes
+        .filter((item) => !isOwnPresence(item))
+        .map((item) => item.shapeId)
+    );
     const result = applyOwnStep(before, step, direction, lockedIds);
 
     if (!result.changed) {
